@@ -61,8 +61,20 @@ class Proxy:
         self.scheduling_policy = scheduling_policy
         self.custom_create_completion = custom_create_completion
         self.custom_create_chat_completion = custom_create_chat_completion
+        # One shared session — creating a ClientSession per forward under high
+        # RPS exhausts FDs ("Too many open files") and then the proxy removes
+        # the only backend → StopIteration on next(cycle([])).
+        self._session: aiohttp.ClientSession | None = None
         self.router = APIRouter()
         self.setup_routes()
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
+            self._session = aiohttp.ClientSession(
+                timeout=AIOHTTP_TIMEOUT, connector=connector
+            )
+        return self._session
 
     def setup_routes(self):
         self.router.post(
@@ -194,46 +206,44 @@ class Proxy:
             raise HTTPException(status_code=500, detail=str(e)) from e
 
     async def forward_request(self, url, data, use_chunked=True):
-        async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
-            headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
-            try:
-                async with session.post(
-                    url=url, json=data, headers=headers
-                ) as response:
-                    if 200 <= response.status < 300 or 400 <= response.status < 500:
-                        if use_chunked:
-                            async for chunk_bytes in response.content.iter_chunked(
-                                1024
-                            ):
-                                yield chunk_bytes
-                        else:
-                            content = await response.read()
-                            yield content
+        session = await self._get_session()
+        headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+        try:
+            async with session.post(url=url, json=data, headers=headers) as response:
+                if 200 <= response.status < 300 or 400 <= response.status < 500:
+                    if use_chunked:
+                        async for chunk_bytes in response.content.iter_chunked(1024):
+                            yield chunk_bytes
                     else:
-                        error_content = await response.text()
-                        try:
-                            error_content = json.loads(error_content)
-                        except json.JSONDecodeError:
-                            error_content = error_content
-                        logger.error(
-                            "Request failed with status %s: %s",
-                            response.status,
-                            error_content,
-                        )
-                        raise HTTPException(
-                            status_code=response.status,
-                            detail=f"Request failed with status {response.status}: "
-                            f"{error_content}",
-                        )
-            except aiohttp.ClientError as e:
-                logger.error("ClientError occurred: %s", str(e))
-                raise HTTPException(
-                    status_code=502,
-                    detail="Bad Gateway: Error communicating with upstream server.",
-                ) from e
-            except Exception as e:
-                logger.error("Unexpected error: %s", str(e))
-                raise HTTPException(status_code=500, detail=str(e)) from e
+                        content = await response.read()
+                        yield content
+                else:
+                    error_content = await response.text()
+                    try:
+                        error_content = json.loads(error_content)
+                    except json.JSONDecodeError:
+                        error_content = error_content
+                    logger.error(
+                        "Request failed with status %s: %s",
+                        response.status,
+                        error_content,
+                    )
+                    raise HTTPException(
+                        status_code=response.status,
+                        detail=f"Request failed with status {response.status}: "
+                        f"{error_content}",
+                    )
+        except aiohttp.ClientError as e:
+            logger.error("ClientError occurred: %s", str(e))
+            raise HTTPException(
+                status_code=502,
+                detail="Bad Gateway: Error communicating with upstream server.",
+            ) from e
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("Unexpected error: %s", str(e))
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
     def schedule(self, cycler: itertools.cycle) -> str:
         return self.scheduling_policy.schedule(cycler)
@@ -255,33 +265,22 @@ class Proxy:
             kv_prepare_request["max_tokens"] = 1
 
             prefill_instance = self.schedule(self.prefill_cycler)
-            try:
-                async for _ in self.forward_request(
-                    f"http://{prefill_instance}/v1/completions", kv_prepare_request
-                ):
-                    continue
-            except HTTPException as http_exc:
-                self.remove_instance_endpoint("prefill", prefill_instance)
-                raise http_exc
+            async for _ in self.forward_request(
+                f"http://{prefill_instance}/v1/completions", kv_prepare_request
+            ):
+                continue
 
             # Perform kv recv and decoding stage
             decode_instance = self.schedule(self.decode_cycler)
-
-            try:
-                generator = self.forward_request(
-                    f"http://{decode_instance}/v1/completions", request
-                )
-            except HTTPException as http_exc:
-                self.remove_instance_endpoint("decode", decode_instance)
-                raise http_exc
-            response = StreamingResponse(generator)
-            return response
+            generator = self.forward_request(
+                f"http://{decode_instance}/v1/completions", request
+            )
+            return StreamingResponse(generator)
         except Exception:
-            import sys
-
             exc_info = sys.exc_info()
             print("Error occurred in disagg proxy server")
             print(exc_info)
+            raise
 
     async def create_chat_completion(self, raw_request: Request):
         try:
@@ -295,26 +294,16 @@ class Proxy:
 
             # prefill stage
             prefill_instance = self.schedule(self.prefill_cycler)
-            try:
-                async for _ in self.forward_request(
-                    f"http://{prefill_instance}/v1/chat/completions", kv_prepare_request
-                ):
-                    continue
-            except HTTPException as http_exc:
-                self.remove_instance_endpoint("prefill", prefill_instance)
-                raise http_exc
+            async for _ in self.forward_request(
+                f"http://{prefill_instance}/v1/chat/completions", kv_prepare_request
+            ):
+                continue
             # Perform kv recv and decoding stage
             decode_instance = self.schedule(self.decode_cycler)
-
-            try:
-                generator = self.forward_request(
-                    "http://" + decode_instance + "/v1/chat/completions", request
-                )
-            except HTTPException as http_exc:
-                self.remove_instance_endpoint("decode", decode_instance)
-                raise http_exc
-            response = StreamingResponse(content=generator)
-            return response
+            generator = self.forward_request(
+                "http://" + decode_instance + "/v1/chat/completions", request
+            )
+            return StreamingResponse(content=generator)
         except Exception:
             exc_info = sys.exc_info()
             error_messages = [str(e) for e in exc_info if e]
@@ -325,10 +314,19 @@ class Proxy:
             )
 
     def remove_instance_endpoint(self, instance_type, instance):
-        if instance_type == "decode" and instance in self.decode_instances:
+        # Never drop the last backend — cycle([]) makes next() raise StopIteration.
+        if (
+            instance_type == "decode"
+            and instance in self.decode_instances
+            and len(self.decode_instances) > 1
+        ):
             self.decode_instances.remove(instance)
             self.decode_cycler = itertools.cycle(self.decode_instances)
-        if instance_type == "prefill" and instance in self.prefill_instances:
+        if (
+            instance_type == "prefill"
+            and instance in self.prefill_instances
+            and len(self.prefill_instances) > 1
+        ):
             self.prefill_instances.remove(instance)
             self.prefill_cycler = itertools.cycle(self.prefill_instances)
 
@@ -338,7 +336,12 @@ class RoundRobinSchedulingPolicy(SchedulingPolicy):
         super().__init__()
 
     def schedule(self, cycler: itertools.cycle) -> str:
-        return next(cycler)
+        try:
+            return next(cycler)
+        except StopIteration as e:
+            raise HTTPException(
+                status_code=503, detail="No backend instances available"
+            ) from e
 
 
 class ProxyServer:

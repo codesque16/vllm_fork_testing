@@ -9,7 +9,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
@@ -279,6 +279,101 @@ async def healthcheck():
         "prefill_instances": len(app.state.prefill_clients),
         "decode_instances": len(app.state.decode_clients),
     }
+
+
+def _inject_pd_labels(body: str, role: str, host: str, port: int) -> str:
+    """Rewrite Prometheus samples with pd_role / pd_instance labels.
+
+    vllm bench reads /metrics on the client-facing base URL (this proxy) for
+    spec-decode counters and num_requests_running. Without /metrics the bench
+    silently skips those; with a raw concat of P+D, duplicate sample names
+    collide — so we label by role/instance.
+    """
+    instance = f"{host}:{port}"
+    extra = f'pd_role="{role}",pd_instance="{instance}"'
+    out: list[str] = []
+    for line in body.splitlines():
+        if not line or line.startswith("#"):
+            out.append(line)
+            continue
+        # metric{labels} value  OR  metric value
+        if "{" in line and "}" in line:
+            brace = line.index("{")
+            close = line.index("}", brace)
+            labels = line[brace + 1 : close].strip()
+            rest = line[close + 1 :]
+            name = line[:brace]
+            if labels:
+                out.append(f"{name}{{{labels},{extra}}}{rest}")
+            else:
+                out.append(f"{name}{{{extra}}}{rest}")
+        else:
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                out.append(f"{parts[0]}{{{extra}}} {parts[1]}")
+            else:
+                out.append(line)
+    return "\n".join(out) + "\n"
+
+
+async def _fetch_backend_metrics(client_info: dict, role: str) -> str:
+    """GET /metrics from one vLLM backend."""
+    client: httpx.AsyncClient = client_info["client"]
+    url = f"http://{client_info['host']}:{client_info['port']}/metrics"
+    try:
+        resp = await client.get(url, timeout=5.0)
+        if resp.status_code != 200:
+            logger.warning(
+                "metrics from %s returned %s",
+                url,
+                resp.status_code,
+            )
+            return ""
+        return _inject_pd_labels(
+            resp.text, role, client_info["host"], client_info["port"]
+        )
+    except Exception as e:
+        logger.warning("failed to scrape metrics from %s: %s", url, e)
+        return ""
+
+
+async def _aggregate_metrics(role: str | None = None) -> Response:
+    """Aggregate Prometheus text from decode and/or prefill backends.
+
+    Decode is listed first so ``vllm:num_requests_running`` (first match in
+    vllm bench) reflects the decode engine under PD load.
+    """
+    chunks: list[str] = []
+    if role in (None, "decode"):
+        for info in getattr(app.state, "decode_clients", []):
+            chunks.append(await _fetch_backend_metrics(info, "decode"))
+    if role in (None, "prefill"):
+        for info in getattr(app.state, "prefill_clients", []):
+            chunks.append(await _fetch_backend_metrics(info, "prefill"))
+    body = "".join(c for c in chunks if c)
+    if not body:
+        return Response(
+            content="# no backend /metrics available\n",
+            media_type="text/plain; version=0.0.4",
+            status_code=503,
+        )
+    return Response(content=body, media_type="text/plain; version=0.0.4")
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus scrape used by ``vllm bench serve`` (base_url/metrics)."""
+    return await _aggregate_metrics(None)
+
+
+@app.get("/prefill/metrics")
+async def prefill_metrics():
+    return await _aggregate_metrics("prefill")
+
+
+@app.get("/decode/metrics")
+async def decode_metrics():
+    return await _aggregate_metrics("decode")
 
 
 if __name__ == "__main__":
