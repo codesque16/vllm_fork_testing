@@ -32,6 +32,15 @@ NIXL_PREFILL_PORT="${NIXL_PREFILL_PORT:-5600}"
 NIXL_DECODE_PORT="${NIXL_DECODE_PORT:-5601}"
 PROXY_SCRIPT="${PROXY_SCRIPT:-}"
 PROXY_PORT="${PROXY_PORT:-8000}"
+# Disagg-DFlash (V*SD*): remote draft server bind + verify connect addr.
+DRAFT_BIND="${DRAFT_BIND:-tcp://0.0.0.0:50051}"
+DRAFT_ADDR="${DRAFT_ADDR:-tcp://127.0.0.1:50051}"
+DISAGG_DFLASH_TRANSPORT="${DISAGG_DFLASH_TRANSPORT:-nixl}"
+WAVE_SIZE="${WAVE_SIZE:-}"
+WAVE_SCHEDULE=1
+DISAGG_ASYNC=1
+# Off by default: SD timing / Disagg profile use CUDA synchronize and skew TPOT.
+ENABLE_DISAGG_PROFILE=0
 # Live terminal + file under startup_logs/<tag>_<role>_<timestamp>.log
 LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/startup_logs}"
 
@@ -44,6 +53,7 @@ DEVICES=""
 PORT=""
 PREFILL_DEVICES=""
 DECODE_DEVICES=""
+DRAFT_DEVICES=""
 PREFILL_PORT="8100"
 DECODE_PORT="8200"
 PRINT_ONLY=0
@@ -58,6 +68,7 @@ CASES=(
   PD2SD1 PD4SD1
   P1_D1 P2_D2
   P1_D1SD1 P2_D2SD2 P2_D2SD1
+  V1SD1 V2SD1
 )
 BATCHED_SWEEP=(4096 8192 16384)
 
@@ -70,21 +81,36 @@ Usage:
 Options:
   --batched-tokens N       max-num-batched-tokens (or use _bN in CASE)
   --max-num-seqs N         max-num-seqs (default: 600, or MAX_NUM_SEQS env)
-  --devices IDS            CUDA_VISIBLE_DEVICES for colocated (e.g. 0,1)
-  --port PORT              HTTP port for colocated server (default 8000)
-  --prefill-devices IDS    GPUs for prefill (disagg)
-  --decode-devices IDS     GPUs for decode (disagg)
+  --devices IDS            CUDA_VISIBLE_DEVICES for colocated / verify (e.g. 0,1)
+  --port PORT              HTTP port for colocated / verify server (default 8000)
+  --prefill-devices IDS    GPUs for prefill (P/D disagg)
+  --decode-devices IDS     GPUs for decode (P/D disagg)
+  --draft-devices IDS      GPUs for Disagg-DFlash draft server (V*SD*)
   --prefill-port PORT      Prefill HTTP port (default 8100)
   --decode-port PORT       Decode HTTP port (default 8200)
+  --draft-bind ADDR        Draft server bind (default tcp://0.0.0.0:50051)
+  --draft-addr ADDR        Verify→draft connect addr (default tcp://127.0.0.1:50051)
+  --wave-size N            disagg_dflash_wave_size (omit = ceil(ready/2))
+  --no-wave-schedule       disagg_dflash_wave_schedule=false
+  --no-disagg-async        disagg_dflash_async_complete=false (sync propose)
+  --enable-disagg-profile  Opt-in SD timing + Disagg/DFlash profile logs
+                           (CUDA sync — skews latency; off by default for benches)
   --proxy                  Also launch toy_proxy_server.py on --proxy-port
   --proxy-port PORT        Client-facing proxy port (default 8000)
   --proxy-script PATH      Override path to toy_proxy_server.py
   --log-dir DIR            Where to write startup logs (default: ./startup_logs)
   --enable-logging-iteration-details
-                           Pass through to vllm serve (off by default)
+                           Opt-in: pass to vllm serve and (for V*SD*) draft
+                           server. Off by default.
   --print-only             Print commands, do not exec
   --list                   List supported cases / full sweep matrix
   -h, --help               Show this help
+
+Cases:
+  PD{tp}[SD{draft_tp}][_bN]           colocated prefill+decode (+ optional SD)
+  P{ptp}_D{dtp}[SD{draft_tp}][_bN]    P/D KV disagg (SD on decode)
+  V{vtp}SD{draft_gpus}[_bN]           Disagg-DFlash: verify + remote draft server
+                                      e.g. V1SD1_b8192  (verify GPU0, draft GPU1)
 
 Logs:
   stdout+stderr are teed live to the terminal and to
@@ -93,6 +119,7 @@ Logs:
 Env overrides:
   MODEL DRAFT_MODEL NUM_SPEC_TOKENS GPU_MEM_UTIL MAX_NUM_SEQS MAX_MODEL_LEN
   BLOCK_SIZE NIXL_PREFILL_PORT NIXL_DECODE_PORT LOG_DIR PROXY_WAIT_TIMEOUT
+  DRAFT_BIND DRAFT_ADDR DISAGG_DFLASH_TRANSPORT WAVE_SIZE
 EOF
 }
 
@@ -101,7 +128,10 @@ list_matrix() {
   printf '  %s\n' "${CASES[@]}"
   echo
   echo "Batched-token sweep values: ${BATCHED_SWEEP[*]}"
-  echo "Full tag form: <CASE>_b<BATCHED>  e.g. PD2SD1_b8192"
+  echo "Full tag form: <CASE>_b<BATCHED>  e.g. PD2SD1_b8192  or  V1SD1_b8192"
+  echo
+  echo "Disagg-DFlash: V{verify_tp}SD{draft_gpus}_bN  (remote draft via NIXL)"
+  echo "  e.g. ./launch_bench_server.sh V1SD1_b8192 --devices 0 --draft-devices 1"
   echo
   echo "=== Full sweep (case × batched) ==="
   for c in "${CASES[@]}"; do
@@ -129,8 +159,14 @@ parse_case() {
   PREFILL_TP=""
   DECODE_TP=""
   DRAFT_TP=""
+  VERIFY_TP=""
+  DRAFT_GPUS=""
 
-  if [[ "$base" =~ ^PD([0-9]+)SD([0-9]+)$ ]]; then
+  if [[ "$base" =~ ^V([0-9]+)SD([0-9]+)$ ]]; then
+    MODE=sd_disagg
+    VERIFY_TP="${BASH_REMATCH[1]}"
+    DRAFT_GPUS="${BASH_REMATCH[2]}"
+  elif [[ "$base" =~ ^PD([0-9]+)SD([0-9]+)$ ]]; then
     MODE=colocated_sd
     TP="${BASH_REMATCH[1]}"
     DRAFT_TP="${BASH_REMATCH[2]}"
@@ -179,6 +215,17 @@ default_disagg_devices() {
   DECODE_DEVICES_DEFAULT=$(IFS=,; echo "${d_ids[*]}")
 }
 
+default_sd_disagg_devices() {
+  # Verify on first VERIFY_TP GPUs; draft on the next DRAFT_GPUS GPUs.
+  local vtp="$1" dgpus="$2"
+  local v_ids=() d_ids=()
+  local i
+  for ((i = 0; i < vtp; i++)); do v_ids+=("$i"); done
+  for ((i = 0; i < dgpus; i++)); do d_ids+=("$((vtp + i))"); done
+  VERIFY_DEVICES_DEFAULT=$(IFS=,; echo "${v_ids[*]}")
+  DRAFT_DEVICES_DEFAULT=$(IFS=,; echo "${d_ids[*]}")
+}
+
 count_csv() {
   local s="$1"
   if [[ -z "$s" ]]; then echo 0; return; fi
@@ -188,9 +235,28 @@ count_csv() {
 spec_json() {
   local draft_tp="$1"
   # Colocated SD: set draft_tensor_parallel_size.
-  # Omit attention_backend unless needed; history uses FLASH_ATTN for disagg-dflash.
   printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,"rejection_sample_method":"synthetic","synthetic_acceptance_rates":%s}' \
     "$DRAFT_MODEL" "$NUM_SPEC_TOKENS" "$draft_tp" "$SYNTH_RATES"
+}
+
+spec_json_sd_disagg() {
+  # Remote DFlash: verify does not load draft weights; RPCs to draft server.
+  local wave_sched="true"
+  local async_c="true"
+  local profile="false"
+  local wave_size_json="null"
+  [[ "$WAVE_SCHEDULE" -eq 1 ]] || wave_sched="false"
+  [[ "$DISAGG_ASYNC" -eq 1 ]] || async_c="false"
+  [[ "$ENABLE_DISAGG_PROFILE" -eq 1 ]] && profile="true"
+  if [[ -n "$WAVE_SIZE" ]]; then
+    wave_size_json="$WAVE_SIZE"
+  fi
+  # Same synthetic acceptance as colocated PD*SD* so paper A/B compares
+  # latency/overlap, not draft quality.
+  printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"rejection_sample_method":"synthetic","synthetic_acceptance_rates":%s,"disagg_dflash_address":"%s","disagg_dflash_transport":"%s","disagg_dflash_cross_step":true,"disagg_dflash_async_complete":%s,"disagg_dflash_wave_schedule":%s,"disagg_dflash_wave_size":%s,"disagg_dflash_profile":%s,"attention_backend":"FLASH_ATTN"}' \
+    "$DRAFT_MODEL" "$NUM_SPEC_TOKENS" "$SYNTH_RATES" \
+    "$DRAFT_ADDR" "$DISAGG_DFLASH_TRANSPORT" \
+    "$async_c" "$wave_sched" "$wave_size_json" "$profile"
 }
 
 kv_json() {
@@ -321,8 +387,15 @@ while [[ $# -gt 0 ]]; do
     --port) PORT="${2:?}"; shift 2 ;;
     --prefill-devices) PREFILL_DEVICES="${2:?}"; shift 2 ;;
     --decode-devices) DECODE_DEVICES="${2:?}"; shift 2 ;;
+    --draft-devices) DRAFT_DEVICES="${2:?}"; shift 2 ;;
     --prefill-port) PREFILL_PORT="${2:?}"; shift 2 ;;
     --decode-port) DECODE_PORT="${2:?}"; shift 2 ;;
+    --draft-bind) DRAFT_BIND="${2:?}"; shift 2 ;;
+    --draft-addr) DRAFT_ADDR="${2:?}"; shift 2 ;;
+    --wave-size) WAVE_SIZE="${2:?}"; shift 2 ;;
+    --no-wave-schedule) WAVE_SCHEDULE=0; shift ;;
+    --no-disagg-async) DISAGG_ASYNC=0; shift ;;
+    --enable-disagg-profile) ENABLE_DISAGG_PROFILE=1; shift ;;
     --proxy-port) PROXY_PORT="${2:?}"; shift 2 ;;
     --proxy-script) PROXY_SCRIPT="${2:?}"; shift 2 ;;
     --log-dir) LOG_DIR="${2:?}"; shift 2 ;;
@@ -476,6 +549,74 @@ case "$MODE" in
         echo "#       --decoder-hosts localhost --decoder-ports ${DECODE_PORT}"
       fi
     fi
+
+    if [[ "$PRINT_ONLY" -eq 0 ]]; then
+      wait
+    fi
+    ;;
+
+  sd_disagg)
+    # Disagg-DFlash: verify (vllm serve) + remote draft_server on separate GPUs.
+    PORT="${PORT:-8000}"
+    default_sd_disagg_devices "$VERIFY_TP" "$DRAFT_GPUS"
+    DEVICES="${DEVICES:-$VERIFY_DEVICES_DEFAULT}"
+    DRAFT_DEVICES="${DRAFT_DEVICES:-$DRAFT_DEVICES_DEFAULT}"
+    n_v=$(count_csv "$DEVICES")
+    n_d=$(count_csv "$DRAFT_DEVICES")
+    [[ "$n_v" -eq "$VERIFY_TP" ]] || die "V${VERIFY_TP} needs ${VERIFY_TP} verify devices, got '${DEVICES}'"
+    [[ "$n_d" -eq "$DRAFT_GPUS" ]] || die "SD${DRAFT_GPUS} needs ${DRAFT_GPUS} draft devices, got '${DRAFT_DEVICES}'"
+
+    draft_cmd=(
+      env
+      VLLM_USE_V2_MODEL_RUNNER=1
+      HF_HUB_OFFLINE=1
+      UCX_NET_DEVICES=all
+      "CUDA_VISIBLE_DEVICES=${DRAFT_DEVICES}"
+      python3 -m vllm.entrypoints.dflash_draft_server
+      --draft-model "$DRAFT_MODEL"
+      --target-model "$MODEL"
+      --num-speculative-tokens "$NUM_SPEC_TOKENS"
+      --bind "$DRAFT_BIND"
+      --transport "$DISAGG_DFLASH_TRANSPORT"
+      --max-model-len "$MAX_MODEL_LEN"
+      --max-num-seqs "$MAX_NUM_SEQS"
+      --gpu-memory-utilization "$GPU_MEM_UTIL"
+      --block-size "$BLOCK_SIZE"
+      --attention-backend FLASH_ATTN
+    )
+    # Same opt-in as verify: only when --enable-logging-iteration-details.
+    if [[ "$ENABLE_LOGGING_ITERATION_DETAILS" -eq 1 ]]; then
+      draft_cmd+=(--enable-logging-iteration-details)
+    fi
+    verify_cmd=(
+      env
+      VLLM_USE_V2_MODEL_RUNNER=1
+      HF_HUB_OFFLINE=1
+      UCX_NET_DEVICES=all
+      "CUDA_VISIBLE_DEVICES=${DEVICES}"
+      vllm serve "$MODEL"
+      --port "$PORT"
+      --tensor-parallel-size "$VERIFY_TP"
+      --speculative-config "$(spec_json_sd_disagg)"
+      "${COMMON[@]}"
+    )
+    if [[ "$ENABLE_DISAGG_PROFILE" -eq 1 ]]; then
+      draft_cmd+=(--enable-sd-timing-model --enable-dflash-draft-profile)
+      verify_cmd+=(--enable-sd-timing-model --enable-disagg-dflash-profile)
+    fi
+
+    run_cmd "${TAG} DRAFT devices=${DRAFT_DEVICES} bind=${DRAFT_BIND} transport=${DISAGG_DFLASH_TRANSPORT}" \
+      "draft" "${draft_cmd[@]}"
+    # Give draft a moment to bind before verify HELLO (print-only skips wait).
+    if [[ "$PRINT_ONLY" -eq 0 ]]; then
+      sleep 2
+    fi
+    run_cmd "${TAG} VERIFY tp=${VERIFY_TP} devices=${DEVICES} port=${PORT} draft=${DRAFT_ADDR}" \
+      "verify" "${verify_cmd[@]}"
+
+    echo
+    echo "# Disagg-DFlash: for overlap debug logs add --enable-disagg-profile (skews latency)"
+    echo "# A/B: --no-wave-schedule and/or --no-disagg-async"
 
     if [[ "$PRINT_ONLY" -eq 0 ]]; then
       wait

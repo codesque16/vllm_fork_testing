@@ -2,13 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch.nn as nn
 
-from vllm.config import VllmConfig, replace
+from vllm.config import ModelConfig, VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _should_share,
     get_target_lm_head,
 )
+
+
+def get_dflash_causal(draft_model_config: ModelConfig) -> bool:
+    """Whether the DFlash draft uses causal (vs non-causal) attention."""
+    dflash_config = getattr(draft_model_config.hf_config, "dflash_config", None) or {}
+    return bool(dflash_config.get("causal", False))
 
 
 def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:

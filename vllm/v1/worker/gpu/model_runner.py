@@ -107,6 +107,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
+from vllm.v1.spec_decode.disagg_dflash.proxy import DisaggDFlashProxy
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
@@ -134,6 +135,44 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+
+        # Disagg/DFlash debug logging — ObservabilityConfig when present,
+        # else speculative_config.disagg_dflash_profile / env-less defaults.
+        from vllm.v1.spec_decode.disagg_dflash.debug_logging import (
+            configure_disagg_debug_logging,
+        )
+
+        obs = self.observability_config
+        spec = self.speculative_config
+        spec_profile = bool(
+            spec is not None and getattr(spec, "disagg_dflash_profile", False)
+        )
+        # disagg_dflash_profile in speculative-config also turns on timing +
+        # verify/draft profile so overlap shows up in logs without extra CLI.
+        configure_disagg_debug_logging(
+            enable_sd_timing_model=bool(getattr(obs, "enable_sd_timing_model", False))
+            or spec_profile,
+            sd_timing_model_log_every=int(
+                getattr(obs, "sd_timing_model_log_every", 20)
+            ),
+            enable_disagg_dflash_profile=bool(
+                getattr(obs, "enable_disagg_dflash_profile", False)
+            )
+            or spec_profile,
+            disagg_dflash_profile_log_every=int(
+                getattr(obs, "disagg_dflash_profile_log_every", 50)
+            ),
+            enable_dflash_draft_profile=bool(
+                getattr(obs, "enable_dflash_draft_profile", False)
+            )
+            or spec_profile,
+            dflash_draft_profile_log_every=int(
+                getattr(obs, "dflash_draft_profile_log_every", 20)
+            ),
+            disagg_dflash_nixl_log_every=int(
+                getattr(obs, "disagg_dflash_nixl_log_every", -1)
+            ),
+        )
 
         self.device = device
         self.dtype = self.model_config.dtype
@@ -303,6 +342,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights
                 )
+            elif isinstance(self.speculator, DisaggDFlashProxy):
+                # Remote draft: load projector + connect draft client (no draft weights).
+                self.speculator.load_model(self.model)
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -314,7 +356,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
-            if self.speculator is not None:
+            # DisaggDFlashProxy has no local draft nn.Module (model is None).
+            if (
+                self.speculator is not None
+                and getattr(self.speculator, "model", None) is not None
+            ):
                 prepare_communication_buffer_for_model(self.speculator.model)
 
         # Initialize the components that require the model.
@@ -791,6 +837,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         preempted_req_ids = scheduler_output.preempted_req_ids
         if preempted_req_ids:
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
+        # Free remote draft state here (not only in sample_tokens). Kernel
+        # warmup cleanup runs execute_model with finished_req_ids but never
+        # calls sample_tokens, which previously leaked Disagg-DFlash slots.
+        if (
+            finished_req_ids
+            and self.speculator is not None
+            and hasattr(self.speculator, "free_requests")
+        ):
+            self.speculator.free_requests(list(finished_req_ids))
         for req_id in finished_req_ids:
             self._remove_request(req_id)
 
@@ -1175,16 +1230,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # Disagg-DFlash cross-step: keep the previous step's draft RTT in flight
+        # across PP update + DP sync, then drain/apply before finish/add.
+        disagg_cross_step = isinstance(self.speculator, DisaggDFlashProxy) and (
+            self.speculator.cross_step_enabled
+        )
+        disagg_async = (
+            disagg_cross_step
+            and isinstance(self.speculator, DisaggDFlashProxy)
+            and self.speculator.async_complete_enabled
+        )
+
         if not dummy_run:
-            # Update the request states.
             self.update_pp_decode_requests()
-            self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
-            self.add_requests(scheduler_output)
-            self.update_requests(scheduler_output)
-            self.block_tables.apply_staged_writes()
-            if scheduler_output.total_num_scheduled_tokens == 0:
-                # No need to run the model.
+            if not disagg_cross_step:
+                if isinstance(self.speculator, DisaggDFlashProxy):
+                    self.speculator.drain_blocking(self.req_states)
+                self.finish_requests(scheduler_output)
+                self.add_requests(scheduler_output)
+                self.update_requests(scheduler_output)
+                self.block_tables.apply_staged_writes()
+                if scheduler_output.total_num_scheduled_tokens == 0:
+                    empty_output = self.kv_connector.no_forward(scheduler_output)
+                    return empty_output
+            elif scheduler_output.total_num_scheduled_tokens == 0:
+                # Nothing to run: must join any in-flight draft before FREE.
+                self.speculator.drain_blocking(self.req_states)
+                self.finish_requests(scheduler_output)
+                self.add_requests(scheduler_output)
+                self.update_requests(scheduler_output)
+                self.block_tables.apply_staged_writes()
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return empty_output
 
@@ -1218,6 +1294,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
         )
+
+        if not dummy_run and disagg_cross_step:
+            # After DP sync: apply completed remote draft without blocking when
+            # async_complete is on; otherwise join like legacy cross-step.
+            assert isinstance(self.speculator, DisaggDFlashProxy)
+            if disagg_async:
+                self.speculator.try_apply_completed(self.req_states)
+            else:
+                self.speculator.drain_blocking(self.req_states)
+            self.finish_requests(scheduler_output)
+            self.add_requests(scheduler_output)
+            self.update_requests(scheduler_output)
+            self.block_tables.apply_staged_writes()
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
@@ -1449,9 +1538,41 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pcp_manager, hidden_states, input_batch
         )
 
+        # Start Disagg projector early so L*H→H runs under rejection sampling.
+        if isinstance(self.speculator, DisaggDFlashProxy):
+            spec_hidden_states = hidden_states
+            if hasattr(self.model, "get_mtp_target_hidden_states"):
+                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            self.speculator.begin_reduce(
+                spec_hidden_states,
+                aux_hidden_states,
+                input_batch.num_tokens,
+            )
+
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+
+        # Fire remote speculate immediately after sample (before PP broadcast)
+        # so PP + prompt_logprobs + AsyncOutput + postprocess all sit under
+        # the draft RTT.
+        disagg_pending = None
+        if isinstance(self.speculator, DisaggDFlashProxy):
+            assert self.sampler is not None
+            disagg_pending = self.speculator.propose_begin(
+                input_batch,
+                attn_metadata,
+                slot_mappings_by_layer,
+                hidden_states,
+                aux_hidden_states,
+                num_sampled,
+                num_rejected,
+                sampler_output.sampled_token_ids,
+                self.req_states.next_prefill_tokens,
+                self.sampler.sampling_states.temperature.gpu,
+                self.sampler.sampling_states.seeds.gpu,
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -1513,7 +1634,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
-        if self.speculator is not None:
+        if disagg_pending is not None:
+            assert isinstance(self.speculator, DisaggDFlashProxy)
+            # Cross-step: defer wait into next execute_model so draft RTT
+            # overlaps EngineCore schedule + execute preamble.
+            defer = (
+                self.speculator.cross_step_enabled
+                and not disagg_pending.early_done
+                and not input_batch.has_structured_output_reqs
+            )
+            if defer:
+                self.speculator.defer_pending(disagg_pending)
+            elif not disagg_pending.early_done:
+                draft_tokens = self.speculator.propose_finish(disagg_pending)
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            # early_done while prior draft in flight: leave existing drafts alone.
+        elif self.speculator is not None:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
@@ -1542,10 +1678,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
-            self.draft_tokens_handler.set_draft_tokens(
-                input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
+            # When Disagg async-complete deferred this batch, do not advertise
+            # placeholder drafts — report inflight instead.
+            deferred_async = (
+                disagg_pending is not None
+                and not disagg_pending.early_done
+                and isinstance(self.speculator, DisaggDFlashProxy)
+                and self.speculator.async_complete_enabled
+                and bool(self.speculator.inflight_req_ids())
             )
+            if not deferred_async:
+                self.draft_tokens_handler.set_draft_tokens(
+                    input_batch,
+                    self.req_states.draft_tokens[input_batch.idx_mapping],
+                )
+            else:
+                # Do not advertise placeholder drafts for the fire-time batch.
+                self.draft_tokens_handler.req_ids = []
+                self.draft_tokens_handler.draft_tokens_np = None
+                self.draft_tokens_handler.num_draft_tokens = (
+                    self.num_speculative_steps
+                )
+            if isinstance(self.speculator, DisaggDFlashProxy) and (
+                self.speculator.async_complete_enabled
+            ):
+                self.draft_tokens_handler.set_remote_draft_status(
+                    inflight_req_ids=sorted(self.speculator.inflight_req_ids()),
+                    ready_req_ids=self.speculator.take_ready_req_ids(),
+                )
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)

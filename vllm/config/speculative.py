@@ -106,6 +106,40 @@ class SpeculativeConfig:
     """Users should pass "draft_tensor_parallel_size". This parameter's purpose is to
     warn users when they mistakenly provide the wrong argument."""
 
+    # Disagg-DFlash: verify process RPCs to a remote draft server.
+    disagg_dflash_address: str | None = None
+    """Control endpoint of a standalone DFlash draft server, e.g.
+    ``tcp://127.0.0.1:50051``. When set with ``method='dflash'``, the verify
+    worker does not load DFlash weights; it reduces aux hidden states locally
+    and RPCs context + speculate to the draft server."""
+    disagg_dflash_timeout_ms: int = Field(default=180_000, ge=1)
+    """Timeout in milliseconds for Disagg-DFlash round-trips."""
+    disagg_dflash_transport: Literal["zmq", "cuda_ipc", "nccl", "nixl"] = "nixl"
+    """Data-plane transport for Disagg-DFlash large tensors.
+
+    - ``nixl`` (default): NIXL WRITE of ``context_hiddens``.
+    - ``zmq``: tensors in multipart ZMQ frames (works cross-node).
+    - ``cuda_ipc``: same-node CUDA IPC staging for ``context_hiddens``.
+    - ``nccl``: reserved stub.
+    """
+    disagg_dflash_ipc_max_num_tokens: int | None = Field(default=None, ge=1)
+    """Staging capacity (tokens) for ``cuda_ipc`` / ``nixl`` transports."""
+    disagg_dflash_cross_step: bool = True
+    """Defer Disagg-DFlash ``propose_finish`` into the next ``execute_model`` so
+    draft RTT overlaps EngineCore schedule / preamble."""
+    disagg_dflash_async_complete: bool = True
+    """When cross-step is on: do not block the worker on ``speculate_wait``.
+    Park fire-time req_ids in ``WAITING_FOR_REMOTE_DRAFT`` until the remote
+    reply is applied. Maps to plan's ``disagg_dflash_async``."""
+    disagg_dflash_wave_schedule: bool = True
+    """Cap decode admission per step so one cohort's draft overlaps another's
+    verify. Set false to schedule all ready decodes (async park still allowed)."""
+    disagg_dflash_wave_size: int | None = Field(default=None, ge=1)
+    """Max decode reqs per step when ``disagg_dflash_wave_schedule`` is on.
+    ``None`` → heuristic ``max(1, ceil(num_ready_decodes/2))`` when ≥2 ready."""
+    disagg_dflash_profile: bool = False
+    """Enable Disagg-DFlash verify-side profile logs (debug only)."""
+
     # Draft model configuration
     quantization: me_quant.QuantizationMethods | str | None = None
     """Quantization method that was used to quantize the draft model weights.
@@ -1276,6 +1310,23 @@ class SpeculativeConfig:
 
         if not self.use_heterogeneous_vocab:
             self.verify_equal_vocab_size_if_draft_model()
+
+        if self.disagg_dflash_address is not None:
+            if self.method != "dflash":
+                raise ValueError(
+                    "disagg_dflash_address is only supported with method='dflash'. "
+                    f"Got method={self.method!r}."
+                )
+            transport = getattr(self, "disagg_dflash_transport", "nixl") or "nixl"
+            if transport == "nccl":
+                raise ValueError(
+                    "disagg_dflash_transport='nccl' is reserved but not "
+                    "implemented. Use 'zmq', 'cuda_ipc', or 'nixl'."
+                )
+            if transport not in ("zmq", "cuda_ipc", "nixl"):
+                raise ValueError(
+                    f"Unknown disagg_dflash_transport={transport!r}."
+                )
         return self
 
     def verify_equal_vocab_size_if_draft_model(self):
@@ -1300,7 +1351,16 @@ class SpeculativeConfig:
         """
         Calculate the maximum number of new slots that might be added to the batch
         when drafting.
+
+        Used to shrink ``max_num_scheduled_tokens`` so the worker still has room
+        for those extra draft slots inside ``max_num_batched_tokens``.
+
+        Disagg-DFlash (remote draft) returns 0: the verify worker never expands
+        the batch for parallel-draft mask tokens — that runs on the draft
+        server.
         """
+        if self.use_disagg_dflash():
+            return 0
         slots_per_req = 0  # for serial non-draft-model methods, no change needed
         if self.parallel_drafting:
             # For parallel drafting, we need one new slot per 'masked' token
@@ -1335,6 +1395,10 @@ class SpeculativeConfig:
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
+
+    def use_disagg_dflash(self) -> bool:
+        """True when DFlash drafting is offloaded to a remote draft server."""
+        return self.use_dflash() and bool(self.disagg_dflash_address)
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"

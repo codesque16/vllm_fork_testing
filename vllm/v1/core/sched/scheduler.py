@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -200,6 +201,8 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        # Disagg-DFlash: draft RPC finished; promote WAITING_FOR_REMOTE_DRAFT.
+        self.finished_recving_draft_req_ids: set[str] = set()
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -238,6 +241,8 @@ class Scheduler(SchedulerInterface):
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        # Disagg-DFlash async complete: reqs waiting on remote draft RPC.
+        self._remote_draft_inflight: set[str] = set()
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -459,11 +464,34 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        # Prefer requests that already have draft tokens ready to verify.
+        self._prioritize_verify_ready_running()
+
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
+
+        # Disagg-DFlash wave scheduling: cap decode admissions so one cohort's
+        # draft can overlap another's verify. Prefills are unrestricted.
+        wave_cap: int | None = None
+        wave_ready_decode = 0
+        wave_admitted_decode = 0
+        spec_cfg = self.vllm_config.speculative_config
+        if (
+            spec_cfg is not None
+            and spec_cfg.use_disagg_dflash()
+            and spec_cfg.disagg_dflash_wave_schedule
+            and spec_cfg.disagg_dflash_async_complete
+        ):
+            wave_ready_decode = sum(
+                1 for r in self.running if not r.is_prefill_chunk
+            )
+            if spec_cfg.disagg_dflash_wave_size is not None:
+                wave_cap = spec_cfg.disagg_dflash_wave_size
+            elif wave_ready_decode >= 2:
+                wave_cap = max(1, math.ceil(wave_ready_decode / 2))
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -495,6 +523,15 @@ class Scheduler(SchedulerInterface):
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
+                req_index += 1
+                continue
+
+            # Wave cap: skip further decode admissions this step (prefills ok).
+            if (
+                wave_cap is not None
+                and not request.is_prefill_chunk
+                and wave_admitted_decode >= wave_cap
+            ):
                 req_index += 1
                 continue
 
@@ -612,6 +649,8 @@ class Scheduler(SchedulerInterface):
             # Schedule the request.
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
+            if wave_cap is not None and not request.is_prefill_chunk:
+                wave_admitted_decode += 1
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -651,6 +690,14 @@ class Scheduler(SchedulerInterface):
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
 
+        if wave_cap is not None and self.current_step % 16 == 0:
+            logger.info(
+                "[DisaggDFlash][wave] admitted=%d ready_decode=%d wave_size=%s",
+                wave_admitted_decode,
+                wave_ready_decode,
+                wave_cap,
+            )
+
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
         if self.lora_config:
@@ -687,8 +734,20 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
+                    elif request.status == RequestStatus.WAITING_FOR_REMOTE_DRAFT:
+                        logger.debug(
+                            "%s is still in WAITING_FOR_REMOTE_DRAFT state.",
+                            request_id,
+                        )
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
+                    continue
+
+                # Draft-wait promote: request already has worker state + KV blocks.
+                # Put it back on running (front) without re-adding as a new req.
+                if request.status == RequestStatus.RUNNING:
+                    request_queue.pop_request()
+                    self.running.insert(0, request)
                     continue
 
                 # Check that adding the request still respects the max_loras
@@ -1953,6 +2012,7 @@ class Scheduler(SchedulerInterface):
         return status in (
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
             RequestStatus.WAITING_FOR_REMOTE_KVS,
+            RequestStatus.WAITING_FOR_REMOTE_DRAFT,
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
@@ -2064,6 +2124,62 @@ class Scheduler(SchedulerInterface):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
             request.spec_token_ids = spec_token_ids
+
+        # Disagg-DFlash async complete: park fire-time reqs into
+        # WAITING_FOR_REMOTE_DRAFT; mark ready ids for promotion (KV-style).
+        if draft_token_ids.remote_draft_inflight_req_ids is not None:
+            inflight = set(draft_token_ids.remote_draft_inflight_req_ids)
+            ready = set(draft_token_ids.remote_draft_ready_req_ids or [])
+            self._park_running_for_remote_draft(inflight - ready)
+            self._remote_draft_inflight = {
+                rid
+                for rid in inflight
+                if (r := self.requests.get(rid)) is not None and not r.is_finished()
+            }
+            for req_id in self._remote_draft_inflight:
+                request = self.requests.get(req_id)
+                if request is not None:
+                    request.spec_token_ids = []
+            placeholder = (
+                [-1] * self.num_spec_tokens if self.num_spec_tokens > 0 else []
+            )
+            for req_id in ready:
+                request = self.requests.get(req_id)
+                if (
+                    request is None
+                    or request.is_finished()
+                    or request.is_prefill_chunk
+                ):
+                    continue
+                self.finished_recving_draft_req_ids.add(req_id)
+                self._remote_draft_inflight.discard(req_id)
+                if placeholder and not request.spec_token_ids:
+                    request.spec_token_ids = list(placeholder)
+
+    def _park_running_for_remote_draft(self, inflight: set[str]) -> None:
+        """Move running reqs awaiting remote draft into skipped_waiting."""
+        if not inflight:
+            return
+        to_park = [
+            req for req in self.running if req.request_id in inflight
+        ]
+        if not to_park:
+            return
+        self.running = remove_all(self.running, set(to_park))
+        for request in to_park:
+            request.status = RequestStatus.WAITING_FOR_REMOTE_DRAFT
+            request.spec_token_ids = []
+            self._enqueue_waiting_request(request)
+
+    def _prioritize_verify_ready_running(self) -> None:
+        """Move running requests with pending draft tokens to the front."""
+        if self.num_spec_tokens <= 0 or len(self.running) <= 1:
+            return
+        verify_ready = [r for r in self.running if r.spec_token_ids]
+        if not verify_ready or len(verify_ready) == len(self.running):
+            return
+        others = [r for r in self.running if not r.spec_token_ids]
+        self.running = verify_ready + others
 
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
@@ -2187,6 +2303,10 @@ class Scheduler(SchedulerInterface):
                 )
                 self.finished_recving_kv_req_ids.discard(request.request_id)
                 self.failed_recving_kv_req_ids.discard(request.request_id)
+
+            if request.status == RequestStatus.WAITING_FOR_REMOTE_DRAFT:
+                self.finished_recving_draft_req_ids.discard(request.request_id)
+                self._remote_draft_inflight.discard(request.request_id)
 
             request.status = finished_status
             self._free_request(request, delay_free_blocks=delay_free_blocks)
@@ -2588,6 +2708,20 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.PREEMPTED
             else:
                 request.status = RequestStatus.WAITING
+            return True
+
+        if request.status == RequestStatus.WAITING_FOR_REMOTE_DRAFT:
+            # finished_recving_draft_req_ids is set in update_draft_token_ids
+            # when the worker reports remote drafts applied.
+            if request.request_id not in self.finished_recving_draft_req_ids:
+                return False
+            # Running is full: keep parked until a slot frees (KV-style wait).
+            if len(self.running) >= self.max_num_running_reqs:
+                return False
+            self.finished_recving_draft_req_ids.discard(request.request_id)
+            self._remote_draft_inflight.discard(request.request_id)
+            # Already has worker state + blocks; caller inserts into running.
+            request.status = RequestStatus.RUNNING
             return True
 
         if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:

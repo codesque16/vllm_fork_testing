@@ -340,6 +340,11 @@ class DraftTokenIds:
     req_ids: list[str]
     # num_reqs x num_draft_tokens
     draft_token_ids: list[list[int]]
+    # Disagg-DFlash async complete: None = no update this step.
+    # list (possibly empty) = authoritative awaiting set from the worker.
+    remote_draft_inflight_req_ids: list[str] | None = None
+    # Req ids whose remote draft was applied this step (None = no update).
+    remote_draft_ready_req_ids: list[str] | None = None
 
 
 def make_empty_encoder_model_runner_output(

@@ -76,6 +76,31 @@ class ObservabilityConfig:
     This includes number of context/generation requests and tokens
     and the elapsed cpu time for the iteration."""
 
+    enable_sd_timing_model: bool = False
+    """Enable speculative-decode Tpv/Tad timing (SDTiming / SDTimingHandoff).
+    Uses CUDA synchronize around verify/draft windows — debug only."""
+
+    sd_timing_model_log_every: int = Field(default=20, ge=1)
+    """Log every N SDTiming samples when --enable-sd-timing-model is set."""
+
+    enable_disagg_dflash_profile: bool = False
+    """Enable Disagg-DFlash verify-side profile logs (projector/pack/fire/await,
+    NIXL/ZMQ client timings). Debug only."""
+
+    disagg_dflash_profile_log_every: int = Field(default=50, ge=1)
+    """Log every N Disagg-DFlash verify profile samples."""
+
+    enable_dflash_draft_profile: bool = False
+    """Enable DFlash draft forward profile (colocated or remote draft).
+    CUDA-synchronizes around draft forward — debug only."""
+
+    dflash_draft_profile_log_every: int = Field(default=20, ge=1)
+    """Log every N DFlash draft forward profile samples."""
+
+    disagg_dflash_nixl_log_every: int = -1
+    """How often to emit Disagg-DFlash NIXL/ZMQ transfer INFO logs.
+    -1 = disabled (default), 0 = every transfer, N>0 = every Nth transfer."""
+
     jit_monitor_mode: Literal["warn", "error"] = "warn"
     """How to handle post-warmup JIT compilation events."""
 

@@ -18,6 +18,27 @@ class DraftTokensHandler:
         self.req_ids: list[str] = []
         self.draft_tokens_np: np.ndarray | None = None
         self.num_draft_tokens: int = 0
+        # Disagg-DFlash async-complete status for the scheduler.
+        # None means "do not update scheduler awaiting set this step".
+        # When set: inflight ids are parked into WAITING_FOR_REMOTE_DRAFT;
+        # ready ids are marked finished_recving_draft for promotion.
+        self.remote_draft_inflight_req_ids: list[str] | None = None
+        self.remote_draft_ready_req_ids: list[str] | None = None
+
+    def set_remote_draft_status(
+        self,
+        *,
+        inflight_req_ids: list[str] | None = None,
+        ready_req_ids: list[str] | None = None,
+    ) -> None:
+        # Always set both when called from the async-complete path so the
+        # scheduler receives an authoritative snapshot.
+        self.remote_draft_inflight_req_ids = (
+            [] if inflight_req_ids is None else list(inflight_req_ids)
+        )
+        self.remote_draft_ready_req_ids = (
+            [] if ready_req_ids is None else list(ready_req_ids)
+        )
 
     def set_draft_tokens(
         self, input_batch: InputBatch, draft_tokens: torch.Tensor
@@ -49,7 +70,16 @@ class DraftTokensHandler:
         else:
             # This case only happens when async scheduling is disabled.
             draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
-        return DraftTokenIds(self.req_ids, draft_token_ids)
+        out = DraftTokenIds(
+            self.req_ids,
+            draft_token_ids,
+            remote_draft_inflight_req_ids=self.remote_draft_inflight_req_ids,
+            remote_draft_ready_req_ids=self.remote_draft_ready_req_ids,
+        )
+        # One-shot: status is consumed by EngineCore.post_step.
+        self.remote_draft_inflight_req_ids = None
+        self.remote_draft_ready_req_ids = None
+        return out
 
 
 def get_parallel_drafting_token_id(hf_config) -> int:
