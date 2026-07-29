@@ -225,6 +225,13 @@ class EngineCore:
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
+        # Disagg-DFlash must push real draft ids (+ remote ready/inflight) through
+        # the scheduler even when async scheduling is on (async normally keeps
+        # draft ids worker-local and only schedules [-1] placeholders).
+        spec_cfg = vllm_config.speculative_config
+        self.draft_ids_via_scheduler = bool(
+            spec_cfg is not None and spec_cfg.use_disagg_dflash()
+        )
 
         self.aborts_queue = queue.Queue[list[str]]()
 
@@ -606,10 +613,22 @@ class EngineCore:
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def post_step(self, model_executed: bool) -> None:
-        # When using async scheduling we can't get draft token ids in advance,
-        # so we update draft token ids in the worker process and don't
-        # need to update draft token ids here.
-        if self.check_for_draft_tokens and not self.async_scheduling and model_executed:
+        # Async scheduling normally keeps draft ids on the worker (scheduler only
+        # packs [-1] count placeholders). Disagg-DFlash fans real ids out via
+        # SchedulerOutput so all TP ranks can hydrate without a draft-token NCCL.
+        # Also poll on empty steps so WAITING_FOR_REMOTE_DRAFT can promote after
+        # drain/try_apply on a zero-token batch.
+        need_draft_ids = self.check_for_draft_tokens and (
+            (
+                model_executed
+                and (not self.async_scheduling or self.draft_ids_via_scheduler)
+            )
+            or (
+                self.draft_ids_via_scheduler
+                and getattr(self.scheduler, "_remote_draft_inflight", None)
+            )
+        )
+        if need_draft_ids:
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)

@@ -417,7 +417,8 @@ class CudaIpcClientTransport(DisaggDFlashClientTransport):
         out = out[:num_reqs, :k].to(
             device=self.device, dtype=torch.int64, non_blocking=True
         )
-        # Ensure tokens are visible on the default stream before NCCL broadcast.
+        # Ensure tokens are visible on the default stream before returning to the
+        # caller (DraftTokenIds / scheduler fan-out; no TP draft-id NCCL).
         torch.cuda.current_stream(self.device).wait_stream(self._stream)
         t4 = time.perf_counter() if profile else 0.0
 

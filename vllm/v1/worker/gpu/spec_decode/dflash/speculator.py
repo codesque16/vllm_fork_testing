@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Mapping
+import time
 from typing import Any
 
 import torch
@@ -8,6 +9,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import get_tp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
@@ -37,6 +39,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
         )
+        # Last verifier Tpv (forward+sample), set by model_runner when
+        # --enable-sd-timing-model is on.
+        self._last_tpv_ms: float = 0.0
 
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
@@ -212,6 +217,10 @@ class DFlashSpeculator(DraftModelSpeculator):
                         layer_names, self.model.get_draft_attn_causal()
                     )
                 }
+
+    def set_tpv_ms(self, tpv_ms: float) -> None:
+        """Record verifier Tpv for the step about to run colocated propose."""
+        self._last_tpv_ms = float(tpv_ms)
 
     @torch.inference_mode()
     def _run_model(
@@ -453,6 +462,18 @@ class DFlashSpeculator(DraftModelSpeculator):
         # so the real token count is num_query_tokens.
         self._prepare_eplb_forward(num_query_tokens)
 
+        # Same window as Disagg draft_forward_ms: query forward (+ sample in
+        # graph), excluding context KV write. Logs via shared SDTiming format.
+        from vllm.v1.spec_decode.disagg_dflash.timing_model import (
+            record_sd_timing,
+            timing_model_enabled,
+        )
+
+        measure_td = timing_model_enabled() and not dummy_run
+        if measure_td:
+            torch.cuda.synchronize()
+            t_fwd = time.perf_counter()
+
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
             self.query_cudagraph_manager.run_fullgraph(batch_desc)
@@ -464,6 +485,21 @@ class DFlashSpeculator(DraftModelSpeculator):
                 draft_slot_mappings_by_layer,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=batch_desc.cg_mode,
+            )
+
+        if measure_td and get_tp_group().rank_in_group == 0:
+            torch.cuda.synchronize()
+            td_ms = (time.perf_counter() - t_fwd) * 1000.0
+            # Colocated: no wire transfer / ZMQ; T_hs=T_tok=0, await=0.
+            record_sd_timing(
+                mode="colocated",
+                num_reqs=num_reqs,
+                tpv_ms=self._last_tpv_ms,
+                ttransfer_ms=0.0,
+                td_ms=td_ms,
+                tzmq_ms=0.0,
+                await_ms=0.0,
+                accepted=0.0,
             )
 
         return self.draft_tokens[:num_reqs]

@@ -247,7 +247,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
+        # Disagg-DFlash always D2H so the scheduler can fan ids to all TP ranks.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
+        if isinstance(self.speculator, DisaggDFlashProxy):
+            self.draft_tokens_handler.force_cpu_draft_ids = True
 
         self.pcp_manager: pcp.PCPManager | None = None
 
@@ -1005,6 +1008,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 idx_mapping, total_num_logits, cu_num_logits, max_expand_len
             )
 
+            # All TP ranks: hydrate GPU draft ids from SchedulerOutput (no NCCL).
+            # Skip async-scheduling [-1] placeholders so we don't wipe real IDs
+            # already written on TP0 (or prior hydrate of real lists).
+            if self.num_speculative_steps > 0:
+                k = self.num_speculative_steps
+                for i, req_id in enumerate(req_ids):
+                    toks = draft_tokens.get(req_id) or ()
+                    if not toks or all(int(t) < 0 for t in toks):
+                        continue
+                    n = min(len(toks), k)
+                    slot = int(idx_mapping_np[i])
+                    self.req_states.draft_tokens[slot, :n].copy_(
+                        torch.as_tensor(
+                            toks[:n], dtype=torch.int64, device=self.device
+                        )
+                    )
+
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
         num_reqs_padded = batch_desc.num_reqs or num_reqs
@@ -1256,11 +1276,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     return empty_output
             elif scheduler_output.total_num_scheduled_tokens == 0:
                 # Nothing to run: must join any in-flight draft before FREE.
-                self.speculator.drain_blocking(self.req_states)
+                # Prefer non-blocking poll when async-complete; block only if
+                # still outstanding so parked WAITING_FOR_REMOTE_DRAFT can
+                # promote on the next schedule.
+                if disagg_async:
+                    self.speculator.try_apply_completed(self.req_states)
+                    if self.speculator.inflight_req_ids():
+                        self.speculator.drain_blocking(self.req_states)
+                else:
+                    self.speculator.drain_blocking(self.req_states)
                 self.finish_requests(scheduler_output)
                 self.add_requests(scheduler_output)
                 self.update_requests(scheduler_output)
                 self.block_tables.apply_staged_writes()
+                # Report ready drafts / remote status so post_step can promote
+                # WAITING_FOR_REMOTE_DRAFT even when this step had no tokens.
+                if isinstance(self.speculator, DisaggDFlashProxy):
+                    ready_ids, ready_toks = self.speculator.take_ready_drafts()
+                    if ready_ids:
+                        self.draft_tokens_handler.add_cpu_draft_tokens(
+                            ready_ids, ready_toks
+                        )
+                    if self.speculator.async_complete_enabled:
+                        self.draft_tokens_handler.set_remote_draft_status(
+                            inflight_req_ids=sorted(
+                                self.speculator.inflight_req_ids()
+                            ),
+                            ready_req_ids=ready_ids,
+                        )
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return empty_output
 
@@ -1428,6 +1471,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Update the EPLB meta.
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
+        # Optional CUDA-synced target forward timing for SDTiming Tpv.
+        measure_tpv = False
+        t_fwd0 = 0.0
+        if (
+            not dummy_run
+            and self.is_last_pp_rank
+            and self.speculator is not None
+            and hasattr(self.speculator, "set_tpv_ms")
+        ):
+            from vllm.v1.spec_decode.disagg_dflash.timing_model import (
+                timing_model_enabled,
+            )
+
+            measure_tpv = timing_model_enabled()
+            if measure_tpv:
+                torch.cuda.synchronize()
+                t_fwd0 = time.perf_counter()
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -1468,6 +1529,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
+        tpv_fwd_ms = 0.0
+        if measure_tpv:
+            torch.cuda.synchronize()
+            tpv_fwd_ms = (time.perf_counter() - t_fwd0) * 1000.0
+
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
                 assert isinstance(model_output, tuple)
@@ -1491,6 +1557,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            tpv_fwd_ms=tpv_fwd_ms,
         )
 
         if not self.is_last_pp_rank:
@@ -1513,6 +1580,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        tpv_fwd_ms = float(self.execute_model_state.tpv_fwd_ms)
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1550,9 +1618,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch.num_tokens,
             )
 
+        measure_tpv = False
+        if self.speculator is not None and hasattr(self.speculator, "set_tpv_ms"):
+            from vllm.v1.spec_decode.disagg_dflash.timing_model import (
+                timing_model_enabled,
+            )
+
+            measure_tpv = timing_model_enabled()
+        if measure_tpv:
+            torch.cuda.synchronize()
+            t_sample0 = time.perf_counter()
+
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+
+        if measure_tpv:
+            torch.cuda.synchronize()
+            tpv_ms = tpv_fwd_ms + (time.perf_counter() - t_sample0) * 1000.0
+            self.speculator.set_tpv_ms(tpv_ms)  # type: ignore[union-attr]
 
         # Fire remote speculate immediately after sample (before PP broadcast)
         # so PP + prompt_logprobs + AsyncOutput + postprocess all sit under
@@ -1678,16 +1762,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
-            # When Disagg async-complete deferred this batch, do not advertise
-            # placeholder drafts — report inflight instead.
-            deferred_async = (
+            # When Disagg deferred this batch's draft RPC, do not advertise
+            # placeholder/stale drafts — real ids arrive via take_ready_drafts.
+            deferred_disagg = (
                 disagg_pending is not None
                 and not disagg_pending.early_done
                 and isinstance(self.speculator, DisaggDFlashProxy)
-                and self.speculator.async_complete_enabled
                 and bool(self.speculator.inflight_req_ids())
             )
-            if not deferred_async:
+            if not deferred_disagg:
                 self.draft_tokens_handler.set_draft_tokens(
                     input_batch,
                     self.req_states.draft_tokens[input_batch.idx_mapping],
@@ -1699,13 +1782,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.draft_tokens_handler.num_draft_tokens = (
                     self.num_speculative_steps
                 )
-            if isinstance(self.speculator, DisaggDFlashProxy) and (
-                self.speculator.async_complete_enabled
-            ):
-                self.draft_tokens_handler.set_remote_draft_status(
-                    inflight_req_ids=sorted(self.speculator.inflight_req_ids()),
-                    ready_req_ids=self.speculator.take_ready_req_ids(),
-                )
+            if isinstance(self.speculator, DisaggDFlashProxy):
+                ready_ids, ready_toks = self.speculator.take_ready_drafts()
+                if ready_ids:
+                    # Real draft ids → scheduler.spec_token_ids → next hydrate.
+                    self.draft_tokens_handler.add_cpu_draft_tokens(
+                        ready_ids, ready_toks
+                    )
+                if self.speculator.async_complete_enabled:
+                    self.draft_tokens_handler.set_remote_draft_status(
+                        inflight_req_ids=sorted(self.speculator.inflight_req_ids()),
+                        ready_req_ids=ready_ids,
+                    )
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
@@ -1826,6 +1914,9 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    # Target forward wall time (ms) when --enable-sd-timing-model; else 0.
+    # Carried on the state so async scheduling cannot mix batches.
+    tpv_fwd_ms: float = 0.0
 
 
 def sort_batch_req_ids(

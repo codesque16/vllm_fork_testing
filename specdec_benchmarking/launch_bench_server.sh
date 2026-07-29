@@ -39,8 +39,13 @@ DISAGG_DFLASH_TRANSPORT="${DISAGG_DFLASH_TRANSPORT:-nixl}"
 WAVE_SIZE="${WAVE_SIZE:-}"
 WAVE_SCHEDULE=1
 DISAGG_ASYNC=1
+# vLLM async scheduling (batch queue). On by default (omit flag → vLLM default).
+ASYNC_SCHEDULING=1
 # Off by default: SD timing / Disagg profile use CUDA synchronize and skew TPOT.
 ENABLE_DISAGG_PROFILE=0
+# NIXL/ZMQ transfer INFO logs: -1 off (default), 0 every xfer, N every Nth.
+# Wall-clock + NIXL telemetry only — no extra CUDA sync for logging.
+NIXL_LOG_EVERY="${NIXL_LOG_EVERY:--1}"
 # Live terminal + file under startup_logs/<tag>_<role>_<timestamp>.log
 LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/startup_logs}"
 
@@ -93,8 +98,14 @@ Options:
   --wave-size N            disagg_dflash_wave_size (omit = ceil(ready/2))
   --no-wave-schedule       disagg_dflash_wave_schedule=false
   --no-disagg-async        disagg_dflash_async_complete=false (sync propose)
-  --enable-disagg-profile  Opt-in SD timing + Disagg/DFlash profile logs
+  --no-async-scheduling    Pass --no-async-scheduling to vllm serve
+                           (disables EngineCore batch-queue async scheduling)
+  --enable-disagg-profile  Opt-in SD timing logs (same [DisaggDFlash][timing]
+                           format for colocated + disagg) + Disagg/DFlash profile
                            (CUDA sync — skews latency; off by default for benches)
+  --nixl-log-every N       NIXL/ZMQ transfer INFO logs on verify + draft:
+                           -1 off (default), 0 every transfer, N every Nth.
+                           Wall-clock + NIXL telemetry (no extra CUDA sync).
   --proxy                  Also launch toy_proxy_server.py on --proxy-port
   --proxy-port PORT        Client-facing proxy port (default 8000)
   --proxy-script PATH      Override path to toy_proxy_server.py
@@ -253,7 +264,7 @@ spec_json_sd_disagg() {
   fi
   # Same synthetic acceptance as colocated PD*SD* so paper A/B compares
   # latency/overlap, not draft quality.
-  printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"rejection_sample_method":"synthetic","synthetic_acceptance_rates":%s,"disagg_dflash_address":"%s","disagg_dflash_transport":"%s","disagg_dflash_cross_step":true,"disagg_dflash_async_complete":%s,"disagg_dflash_wave_schedule":%s,"disagg_dflash_wave_size":%s,"disagg_dflash_profile":%s,"attention_backend":"FLASH_ATTN"}' \
+  printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"rejection_sample_method":"synthetic","synthetic_acceptance_rates":%s,"disagg_dflash_address":"%s","disagg_dflash_transport":"%s","disagg_dflash_cross_step":true,"disagg_dflash_async_complete":%s,"disagg_dflash_wave_schedule":%s,"disagg_dflash_wave_size":%s,"disagg_dflash_profile":%s,"attention_backend":"FLASHINFER"}' \
     "$DRAFT_MODEL" "$NUM_SPEC_TOKENS" "$SYNTH_RATES" \
     "$DRAFT_ADDR" "$DISAGG_DFLASH_TRANSPORT" \
     "$async_c" "$wave_sched" "$wave_size_json" "$profile"
@@ -395,7 +406,9 @@ while [[ $# -gt 0 ]]; do
     --wave-size) WAVE_SIZE="${2:?}"; shift 2 ;;
     --no-wave-schedule) WAVE_SCHEDULE=0; shift ;;
     --no-disagg-async) DISAGG_ASYNC=0; shift ;;
+    --no-async-scheduling) ASYNC_SCHEDULING=0; shift ;;
     --enable-disagg-profile) ENABLE_DISAGG_PROFILE=1; shift ;;
+    --nixl-log-every) NIXL_LOG_EVERY="${2:?}"; shift 2 ;;
     --proxy-port) PROXY_PORT="${2:?}"; shift 2 ;;
     --proxy-script) PROXY_SCRIPT="${2:?}"; shift 2 ;;
     --log-dir) LOG_DIR="${2:?}"; shift 2 ;;
@@ -445,6 +458,9 @@ COMMON+=("${EXTRA_ARGS[@]}")
 if [[ "$ENABLE_LOGGING_ITERATION_DETAILS" -eq 1 ]]; then
   COMMON+=(--enable-logging-iteration-details)
 fi
+if [[ "$ASYNC_SCHEDULING" -eq 0 ]]; then
+  COMMON+=(--no-async-scheduling)
+fi
 
 case "$MODE" in
   colocated|colocated_sd)
@@ -465,6 +481,10 @@ case "$MODE" in
     )
     if [[ "$MODE" == colocated_sd ]]; then
       cmd+=(--speculative-config "$(spec_json "$DRAFT_TP")")
+    fi
+    if [[ "$ENABLE_DISAGG_PROFILE" -eq 1 ]]; then
+      # Same --enable-sd-timing-model log line as Disagg (mode=colocated).
+      cmd+=(--enable-sd-timing-model)
     fi
     run_cmd "${TAG} colocated tp=${TP} devices=${DEVICES} port=${PORT}" \
       "colocated" "${cmd[@]}"
@@ -588,6 +608,9 @@ case "$MODE" in
     if [[ "$ENABLE_LOGGING_ITERATION_DETAILS" -eq 1 ]]; then
       draft_cmd+=(--enable-logging-iteration-details)
     fi
+    if [[ "$NIXL_LOG_EVERY" != "-1" ]]; then
+      draft_cmd+=(--disagg-dflash-nixl-log-every "$NIXL_LOG_EVERY")
+    fi
     verify_cmd=(
       env
       VLLM_USE_V2_MODEL_RUNNER=1
@@ -604,6 +627,9 @@ case "$MODE" in
       draft_cmd+=(--enable-sd-timing-model --enable-dflash-draft-profile)
       verify_cmd+=(--enable-sd-timing-model --enable-disagg-dflash-profile)
     fi
+    if [[ "$NIXL_LOG_EVERY" != "-1" ]]; then
+      verify_cmd+=(--disagg-dflash-nixl-log-every "$NIXL_LOG_EVERY")
+    fi
 
     run_cmd "${TAG} DRAFT devices=${DRAFT_DEVICES} bind=${DRAFT_BIND} transport=${DISAGG_DFLASH_TRANSPORT}" \
       "draft" "${draft_cmd[@]}"
@@ -616,7 +642,9 @@ case "$MODE" in
 
     echo
     echo "# Disagg-DFlash: for overlap debug logs add --enable-disagg-profile (skews latency)"
+    echo "# NIXL xfer logs (no extra CUDA sync): --nixl-log-every 0"
     echo "# A/B: --no-wave-schedule and/or --no-disagg-async"
+    echo "# Sync EngineCore: --no-async-scheduling"
 
     if [[ "$PRINT_ONLY" -eq 0 ]]; then
       wait

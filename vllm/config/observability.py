@@ -99,7 +99,12 @@ class ObservabilityConfig:
 
     disagg_dflash_nixl_log_every: int = -1
     """How often to emit Disagg-DFlash NIXL/ZMQ transfer INFO logs.
-    -1 = disabled (default), 0 = every transfer, N>0 = every Nth transfer."""
+    -1 = disabled (default), 0 = every transfer, N>0 = every Nth transfer.
+
+    Verify-side logs use wall-clock e2e + NIXL ``get_xfer_telemetry``
+    (postDuration / xferDuration) — no extra CUDA synchronize for logging.
+    Draft-side logs nbytes/n_ctx after the existing visibility fence.
+    """
 
     jit_monitor_mode: Literal["warn", "error"] = "warn"
     """How to handle post-warmup JIT compilation events."""

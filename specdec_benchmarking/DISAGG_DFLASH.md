@@ -102,4 +102,7 @@ Results land in `bench_results/<tag>/r<RATE>/`. Report request throughput, outpu
 
 ## Profiling vs benchmarks
 
-**Default: timing/profile off.** Opt-in with `--enable-disagg-profile` only for overlap debug (`slack_ms`, `await_ms`). Those paths CUDA-sync and skew latency.
+- **Default: timing/profile off.** Opt-in with `--enable-disagg-profile` only for overlap debug (`slack_ms`, `await_ms`, `nixl_await_ms`). Those paths CUDA-sync and skew latency.
+- **NIXL transfer logs (cheap):** `--nixl-log-every 0` (every xfer) or `--nixl-log-every N`. Wall-clock + NIXL telemetry on verify; draft logs nbytes. No extra CUDA sync for logging.
+- NIXL WRITE is posted in `speculate_begin` and joined in `speculate_wait` so HS DMA can overlap verify post-sample; ZMQ meta is sent only after NIXL DONE.
+- Draft token ids: TP0 only talks to the draft server. Real ids go `DraftTokenIds` → scheduler `request.spec_token_ids` → next `SchedulerOutput.scheduled_spec_decode_tokens` → **all TP ranks hydrate** `req_states.draft_tokens` (no draft-token NCCL broadcast).

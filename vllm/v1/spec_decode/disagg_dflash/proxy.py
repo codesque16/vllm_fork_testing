@@ -111,9 +111,12 @@ class DisaggDFlashProxy(BaseSpeculator):
             max_workers=1, thread_name_prefix="disagg-dflash-wait"
         )
         self._wait_future: Future[Any] | None = None
-        # Req ids whose remote draft was applied since the last status poll
-        # (consumed by DraftTokensHandler / scheduler).
+        # Req ids + CPU token lists whose remote draft was applied since the
+        # last status poll (consumed by DraftTokensHandler / scheduler).
+        # Draft ids are NOT NCCL-broadcast; the scheduler fans them out via
+        # SchedulerOutput.scheduled_spec_decode_tokens and all ranks hydrate.
         self._ready_req_ids: list[str] = []
+        self._ready_draft_token_ids: list[list[int]] = []
         # Side-stream projector so reduce_aux can run under rejection sampling.
         self._proj_stream = torch.cuda.Stream(device=device)
         self._proj_ready = torch.cuda.Event(enable_timing=False)
@@ -194,6 +197,11 @@ class DisaggDFlashProxy(BaseSpeculator):
         num_tokens: int,
     ) -> None:
         """Launch L*H→H projector on a side stream (overlaps with sample())."""
+        # Only TP0 packs hiddens for the draft server.
+        if self._tp_rank != 0:
+            self._proj_inflight = False
+            self._proj_reduced = None
+            return
         if self._projector is None:
             self._proj_inflight = False
             self._proj_reduced = last_hidden_states[:num_tokens]
@@ -321,6 +329,14 @@ class DisaggDFlashProxy(BaseSpeculator):
         self._ready_req_ids = []
         return ready
 
+    def take_ready_drafts(self) -> tuple[list[str], list[list[int]]]:
+        """Return (req_ids, draft_token_id_lists) applied since last take."""
+        req_ids = self._ready_req_ids
+        token_ids = self._ready_draft_token_ids
+        self._ready_req_ids = []
+        self._ready_draft_token_ids = []
+        return req_ids, token_ids
+
     def defer_pending(self, pending: DisaggProposePending) -> None:
         """Hold fire-time pending until apply/drain completes it."""
         if self._deferred_pending is not None and not self._deferred_pending.early_done:
@@ -338,61 +354,59 @@ class DisaggDFlashProxy(BaseSpeculator):
     def _apply_pending(
         self, pending: DisaggProposePending, req_states: Any | None
     ) -> list[str]:
-        """Finish ``pending`` (blocking join if needed) and write draft tokens."""
+        """Finish ``pending`` (TP0) and stash CPU draft ids for the scheduler.
+
+        GPU ``req_states.draft_tokens`` are hydrated on all ranks from the next
+        ``SchedulerOutput.scheduled_spec_decode_tokens``; optional TP0 write is
+        only a local cache until that round-trip.
+        """
         draft = self.propose_finish(pending)
-        if req_states is not None and pending.idx_mapping is not None:
-            # Only write rows whose fire-time req_id is still tracked.
-            alive = [rid for rid in pending.req_ids if rid in self._known_req_ids]
-            if alive and len(alive) == len(pending.req_ids):
-                req_states.draft_tokens[pending.idx_mapping] = draft
-            elif alive:
-                # Partial finish: write per surviving req by matching ids.
-                for i, rid in enumerate(pending.req_ids):
-                    if rid not in self._known_req_ids:
-                        continue
-                    # idx_mapping[i] is the request-state slot at fire time.
-                    slot = int(pending.idx_mapping[i].item())
-                    req_states.draft_tokens[slot] = draft[i]
         applied = list(pending.req_ids)
-        self._ready_req_ids.extend(applied)
+        if self._tp_rank == 0:
+            token_lists = draft[: len(applied)].detach().cpu().tolist()
+            self._ready_req_ids.extend(applied)
+            self._ready_draft_token_ids.extend(token_lists)
+            if req_states is not None and pending.idx_mapping is not None:
+                # Optional local cache; next-step hydrate is the source of truth.
+                alive = [rid for rid in pending.req_ids if rid in self._known_req_ids]
+                if alive and len(alive) == len(pending.req_ids):
+                    req_states.draft_tokens[pending.idx_mapping] = draft
+                elif alive:
+                    for i, rid in enumerate(pending.req_ids):
+                        if rid not in self._known_req_ids:
+                            continue
+                        slot = int(pending.idx_mapping[i].item())
+                        req_states.draft_tokens[slot] = draft[i]
         return applied
 
     def try_apply_completed(self, req_states: Any | None) -> list[str] | None:
-        """Non-blocking poll: apply draft if bg wait is done (TP-collective).
+        """Non-blocking poll: apply draft if bg wait is done (TP0 only).
 
-        All TP ranks must call this every step so the ready-bit broadcast and
-        token broadcast stay matched. Returns applied req_ids, or None if the
-        in-flight speculate is still outstanding / absent.
+        Non-TP0 never tracks deferred pending (propose_begin returns
+        early_done); draft ids reach all ranks via the scheduler.
         """
-        pending = self._deferred_pending
-        ready = torch.zeros(1, dtype=torch.int32, device=self.device)
-        if self._tp_rank == 0:
-            if pending is None:
-                pass
-            elif pending.early_done:
-                ready[0] = 1
-            elif self._poll_into_completed(blocking=False):
-                ready[0] = 1
-        if self._tp_size > 1:
-            torch.distributed.broadcast(
-                ready,
-                src=get_tp_group().ranks[0],
-                group=get_tp_group().device_group,
-            )
-        if int(ready.item()) == 0:
+        if self._tp_rank != 0:
             return None
+        pending = self._deferred_pending
         if pending is None:
+            return None
+        if not pending.early_done and not self._poll_into_completed(blocking=False):
             return None
         self._deferred_pending = None
         self._completed = None
         return self._apply_pending(pending, req_states)
 
     def drain_blocking(self, req_states: Any | None) -> list[str] | None:
-        """Block until the deferred speculate completes and apply it."""
+        """Block until the deferred speculate completes and apply it (TP0 only)."""
+        if self._tp_rank != 0:
+            # Non-TP0 does not defer; nothing to drain.
+            self._deferred_pending = None
+            self._completed = None
+            return None
         pending = self._deferred_pending
         if pending is None:
             return None
-        if self._tp_rank == 0 and not pending.early_done:
+        if not pending.early_done:
             self._poll_into_completed(blocking=True)
         self._deferred_pending = None
         self._completed = None
@@ -551,8 +565,10 @@ class DisaggDFlashProxy(BaseSpeculator):
 
         # One in-flight remote speculate: skip firing while a prior batch's
         # draft RPC is still outstanding (async-complete packs other work).
+        # Only TP0 tracks deferred pending (non-TP0 always early_done below).
         if (
             self._async_complete
+            and self._tp_rank == 0
             and self._deferred_pending is not None
             and not self._deferred_pending.early_done
         ):
@@ -569,6 +585,16 @@ class DisaggDFlashProxy(BaseSpeculator):
         # draft slots for those synthetic requests.
         if any(rid.startswith("_warmup_") for rid in req_ids):
             self.draft_tokens[:num_reqs].zero_()
+            return DisaggProposePending(
+                num_reqs=num_reqs,
+                early_done=True,
+                idx_mapping=idx_mapping,
+                req_ids=req_ids_list,
+            )
+
+        # Draft RPC / wait is TP0-only. Other ranks hydrate drafts from the
+        # next SchedulerOutput (no draft-token NCCL broadcast).
+        if self._tp_rank != 0:
             return DisaggProposePending(
                 num_reqs=num_reqs,
                 early_done=True,
@@ -676,7 +702,9 @@ class DisaggDFlashProxy(BaseSpeculator):
             t_pack1 = time.perf_counter() if profile else 0.0
             self._client.speculate_begin(req)
             t_fire = time.perf_counter() if profile else 0.0
-            # Overlap ZMQ RTT with verify post-sample / next-step preamble.
+            # Overlap NIXL WRITE (+ later draft RTT) with verify post-sample /
+            # next-step preamble. ZMQ meta is sent from speculate_wait after
+            # NIXL DONE so draft never reads stale staging.
             self._start_background_wait()
             pending.t_pack0 = t_pack0
             pending.t_pack1 = t_pack1
@@ -692,9 +720,17 @@ class DisaggDFlashProxy(BaseSpeculator):
 
     @torch.inference_mode()
     def propose_finish(self, pending: DisaggProposePending) -> torch.Tensor:
-        """Wait for in-flight draft tokens and broadcast to the TP group."""
+        """Wait for in-flight draft tokens on TP0 (no TP draft-id broadcast).
+
+        Tokens are reported to the scheduler via DraftTokenIds; the next
+        SchedulerOutput hydrates ``req_states.draft_tokens`` on every rank.
+        """
         num_reqs = pending.num_reqs
         if pending.early_done:
+            return self.draft_tokens[:num_reqs]
+
+        if self._tp_rank != 0:
+            # Non-TP0 should not reach here (propose_begin returns early_done).
             return self.draft_tokens[:num_reqs]
 
         profile = pending.profile
@@ -704,61 +740,38 @@ class DisaggDFlashProxy(BaseSpeculator):
         measure_await = profile or timing_model_enabled()
         t_wait0 = time.perf_counter() if measure_await else 0.0
 
-        draft_tokens: torch.Tensor
-        draft_forward_ms: float | None = None
-        client_ms: dict[str, float] = {}
-        await_ms = 0.0
-        if self._tp_rank == 0:
-            assert self._client is not None
-            resp = pending.response
+        assert self._client is not None
+        resp = pending.response
+        used_bg_wait = resp is not None
+        if resp is None:
+            resp = self._take_background_wait(blocking=True)
             used_bg_wait = resp is not None
-            if resp is None:
-                resp = self._take_background_wait(blocking=True)
-                used_bg_wait = resp is not None
-            if resp is None:
-                with self._client_lock:
-                    resp = self._client.speculate_wait()
-            pending.response = None
-            t_wait1 = time.perf_counter() if measure_await else 0.0
-            if measure_await:
-                await_ms = (t_wait1 - t_wait0) * 1000.0
-            draft_forward_ms = resp.draft_forward_ms
-            draft_tokens = resp.draft_tokens.to(
-                device=self.device, dtype=torch.int64, non_blocking=True
-            )
-            raw_client_ms = getattr(self._client, "last_timings_ms", None)
-            if isinstance(raw_client_ms, dict):
-                client_ms = dict(raw_client_ms)
-            if profile:
-                speculate_ms["await_ms"] = await_ms
-                if pending.t_fire > 0:
-                    # Wall time from fire until we join the wait (includes any
-                    # work that ran while the background wait was in flight).
-                    speculate_ms["verify_overlap_ms"] = (
-                        t_wait0 - pending.t_fire
-                    ) * 1000.0
-                speculate_ms["bg_wait"] = 1.0 if used_bg_wait else 0.0
-                speculate_ms.update(client_ms)
-        else:
-            draft_tokens = torch.empty(
-                num_reqs,
-                self.num_speculative_steps,
-                dtype=torch.int64,
-                device=self.device,
-            )
-
-        t_bcast0 = time.perf_counter() if profile else 0.0
-        if self._tp_size > 1:
-            torch.distributed.broadcast(
-                draft_tokens,
-                src=get_tp_group().ranks[0],
-                group=get_tp_group().device_group,
-            )
+        if resp is None:
+            with self._client_lock:
+                resp = self._client.speculate_wait()
+        pending.response = None
+        t_wait1 = time.perf_counter() if measure_await else 0.0
+        await_ms = (t_wait1 - t_wait0) * 1000.0 if measure_await else 0.0
+        draft_forward_ms = resp.draft_forward_ms
+        draft_tokens = resp.draft_tokens.to(
+            device=self.device, dtype=torch.int64, non_blocking=True
+        )
+        raw_client_ms = getattr(self._client, "last_timings_ms", None)
+        client_ms = dict(raw_client_ms) if isinstance(raw_client_ms, dict) else {}
         if profile:
+            speculate_ms["await_ms"] = await_ms
+            if pending.t_fire > 0:
+                # Wall time from fire until we join the wait (includes any
+                # work that ran while the background wait was in flight).
+                speculate_ms["verify_overlap_ms"] = (
+                    t_wait0 - pending.t_fire
+                ) * 1000.0
+            speculate_ms["bg_wait"] = 1.0 if used_bg_wait else 0.0
+            speculate_ms.update(client_ms)
             torch.cuda.synchronize()
-            t_bcast1 = time.perf_counter()
-            speculate_ms["broadcast_ms"] = (t_bcast1 - t_bcast0) * 1000.0
-            speculate_ms["propose_total_ms"] = (t_bcast1 - pending.t_proj0) * 1000.0
+            t_done = time.perf_counter()
+            speculate_ms["broadcast_ms"] = 0.0  # ids via scheduler, not NCCL
+            speculate_ms["propose_total_ms"] = (t_done - pending.t_proj0) * 1000.0
             self._profile_steps += 1
             if self._profile_steps % max(1, self._profile_every) == 0:
                 # Parseable profile line: compare proj/pack/fire vs await to see
@@ -780,15 +793,14 @@ class DisaggDFlashProxy(BaseSpeculator):
                     {k: round(v, 2) for k, v in speculate_ms.items()},
                 )
 
-        if self._tp_rank == 0:
-            self._record_sd_timing(
-                num_reqs=num_reqs,
-                tpv_ms=pending.tpv_ms,
-                client_ms=client_ms,
-                draft_forward_ms=draft_forward_ms,
-                await_ms=await_ms,
-                accepted=pending.accepted,
-            )
+        self._record_sd_timing(
+            num_reqs=num_reqs,
+            tpv_ms=pending.tpv_ms,
+            client_ms=client_ms,
+            draft_forward_ms=draft_forward_ms,
+            await_ms=await_ms,
+            accepted=pending.accepted,
+        )
 
         self.draft_tokens[:num_reqs].copy_(draft_tokens[:num_reqs])
         return self.draft_tokens[:num_reqs]

@@ -650,6 +650,25 @@ class EngineArgs:
     enable_logging_iteration_details: bool = (
         ObservabilityConfig.enable_logging_iteration_details
     )
+    enable_sd_timing_model: bool = ObservabilityConfig.enable_sd_timing_model
+    sd_timing_model_log_every: int = get_field(
+        ObservabilityConfig, "sd_timing_model_log_every"
+    )
+    enable_disagg_dflash_profile: bool = (
+        ObservabilityConfig.enable_disagg_dflash_profile
+    )
+    disagg_dflash_profile_log_every: int = get_field(
+        ObservabilityConfig, "disagg_dflash_profile_log_every"
+    )
+    enable_dflash_draft_profile: bool = (
+        ObservabilityConfig.enable_dflash_draft_profile
+    )
+    dflash_draft_profile_log_every: int = get_field(
+        ObservabilityConfig, "dflash_draft_profile_log_every"
+    )
+    disagg_dflash_nixl_log_every: int = (
+        ObservabilityConfig.disagg_dflash_nixl_log_every
+    )
     jit_monitor_mode: Literal["warn", "error"] = ObservabilityConfig.jit_monitor_mode
     jit_monitor_verbose: bool = ObservabilityConfig.jit_monitor_verbose
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
@@ -1403,6 +1422,34 @@ class EngineArgs:
             **observability_kwargs["enable_logging_iteration_details"],
         )
         observability_group.add_argument(
+            "--enable-sd-timing-model",
+            **observability_kwargs["enable_sd_timing_model"],
+        )
+        observability_group.add_argument(
+            "--sd-timing-model-log-every",
+            **observability_kwargs["sd_timing_model_log_every"],
+        )
+        observability_group.add_argument(
+            "--enable-disagg-dflash-profile",
+            **observability_kwargs["enable_disagg_dflash_profile"],
+        )
+        observability_group.add_argument(
+            "--disagg-dflash-profile-log-every",
+            **observability_kwargs["disagg_dflash_profile_log_every"],
+        )
+        observability_group.add_argument(
+            "--enable-dflash-draft-profile",
+            **observability_kwargs["enable_dflash_draft_profile"],
+        )
+        observability_group.add_argument(
+            "--dflash-draft-profile-log-every",
+            **observability_kwargs["dflash_draft_profile_log_every"],
+        )
+        observability_group.add_argument(
+            "--disagg-dflash-nixl-log-every",
+            **observability_kwargs["disagg_dflash_nixl_log_every"],
+        )
+        observability_group.add_argument(
             "--jit-monitor-mode",
             **observability_kwargs["jit_monitor_mode"],
         )
@@ -1831,6 +1878,13 @@ class EngineArgs:
             enable_mfu_metrics=self.enable_mfu_metrics,
             enable_mm_processor_stats=self.enable_mm_processor_stats,
             enable_logging_iteration_details=self.enable_logging_iteration_details,
+            enable_sd_timing_model=self.enable_sd_timing_model,
+            sd_timing_model_log_every=self.sd_timing_model_log_every,
+            enable_disagg_dflash_profile=self.enable_disagg_dflash_profile,
+            disagg_dflash_profile_log_every=self.disagg_dflash_profile_log_every,
+            enable_dflash_draft_profile=self.enable_dflash_draft_profile,
+            dflash_draft_profile_log_every=self.dflash_draft_profile_log_every,
+            disagg_dflash_nixl_log_every=self.disagg_dflash_nixl_log_every,
             jit_monitor_mode=self.jit_monitor_mode,
             jit_monitor_verbose=self.jit_monitor_verbose,
         )

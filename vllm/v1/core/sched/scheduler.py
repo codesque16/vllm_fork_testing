@@ -2127,7 +2127,13 @@ class Scheduler(SchedulerInterface):
 
         # Disagg-DFlash async complete: park fire-time reqs into
         # WAITING_FOR_REMOTE_DRAFT; mark ready ids for promotion (KV-style).
-        if draft_token_ids.remote_draft_inflight_req_ids is not None:
+        # Skip parking under async scheduling — requests stay running with
+        # count placeholders; real ids land via the zip above and GPU apply /
+        # next-step hydrate (parking + empty-batch was a deadlock).
+        if (
+            draft_token_ids.remote_draft_inflight_req_ids is not None
+            and not self.scheduler_config.async_scheduling
+        ):
             inflight = set(draft_token_ids.remote_draft_inflight_req_ids)
             ready = set(draft_token_ids.remote_draft_ready_req_ids or [])
             self._park_running_for_remote_draft(inflight - ready)
@@ -2140,9 +2146,6 @@ class Scheduler(SchedulerInterface):
                 request = self.requests.get(req_id)
                 if request is not None:
                     request.spec_token_ids = []
-            placeholder = (
-                [-1] * self.num_spec_tokens if self.num_spec_tokens > 0 else []
-            )
             for req_id in ready:
                 request = self.requests.get(req_id)
                 if (
@@ -2153,8 +2156,14 @@ class Scheduler(SchedulerInterface):
                     continue
                 self.finished_recving_draft_req_ids.add(req_id)
                 self._remote_draft_inflight.discard(req_id)
-                if placeholder and not request.spec_token_ids:
-                    request.spec_token_ids = list(placeholder)
+                # Real draft ids were set above from DraftTokenIds (no
+                # [-1]*K placeholders — all TP ranks hydrate from SchedulerOutput).
+                if not request.spec_token_ids:
+                    logger.warning(
+                        "Disagg-DFlash ready req %s has empty spec_token_ids; "
+                        "verify will skip drafts this step.",
+                        req_id,
+                    )
 
     def _park_running_for_remote_draft(self, inflight: set[str]) -> None:
         """Move running reqs awaiting remote draft into skipped_waiting."""
