@@ -155,6 +155,9 @@ def _copy_embedding_and_lm_head_from_target(
 class _BlockPool:
     def __init__(self, num_blocks: int):
         # Block 0 reserved as null.
+        # Free list as a stack: allocate/free touch only the end (O(n_alloc)).
+        # The old `self._free = self._free[n:]` copied the entire remaining
+        # pool on every alloc (~2M blocks → ~10ms spikes in prep_ensure_ms).
         self.num_blocks = num_blocks
         self._free = list(range(1, num_blocks))
 
@@ -168,8 +171,10 @@ class _BlockPool:
                 f"(total={self.num_blocks - 1} usable). "
                 f"Raise --num-gpu-blocks or check FREE RPCs are reaching the draft."
             )
-        out = self._free[:n]
-        self._free = self._free[n:]
+        # Pop from the end so we never rewrite the remaining free list.
+        start = len(self._free) - n
+        out = self._free[start:]
+        del self._free[start:]
         return out
 
     def free(self, blocks: list[int]) -> None:
