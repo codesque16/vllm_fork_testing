@@ -5,6 +5,12 @@
 #   ./launch_bench_server.sh --list
 #   ./launch_bench_server.sh PD1_b8192 --devices 0 --port 8000
 #   ./launch_bench_server.sh PD2SD1 --devices 0,1 --port 8000 --batched-tokens 8192
+#   ./launch_bench_server.sh PD4SD1_b8192 --devices 0,1,2,3 --port 8000 \
+#       --no-async-scheduling --enable-logging-iteration-details --enable-disagg-profile
+#   ./launch_bench_server.sh V1SD1_b8192 --devices 0 --draft-devices 1 --port 8000
+#   ./launch_bench_server.sh V4SD1_b8192 --devices 0,1,2,3 --draft-devices 4 --port 8000 \
+#       --no-wave-schedule --no-disagg-async --no-async-scheduling \
+#       --enable-logging-iteration-details --nixl-log-every 0 --enable-disagg-profile
 #   ./launch_bench_server.sh P2_D2SD1 \
 #       --prefill-devices 0,1 --decode-devices 2,3 \
 #       --prefill-port 8100 --decode-port 8200 --batched-tokens 16384
@@ -14,6 +20,7 @@
 # Case grammar:
 #   PD{tp}[SD{draft_tp}][_b{batched}]     colocated prefill+decode
 #   P{ptp}_D{dtp}[SD{draft_tp}][_b{batched}]   PD disagg (SD on decode)
+#   V{vtp}SD{draft_gpus}[_b{batched}]          Disagg-DFlash verify + remote draft
 #
 # Defaults match recent gpt-oss-20b / DFlash / Nixl runs on this machine.
 
@@ -32,9 +39,14 @@ NIXL_PREFILL_PORT="${NIXL_PREFILL_PORT:-5600}"
 NIXL_DECODE_PORT="${NIXL_DECODE_PORT:-5601}"
 PROXY_SCRIPT="${PROXY_SCRIPT:-}"
 PROXY_PORT="${PROXY_PORT:-8000}"
-# Disagg-DFlash (V*SD*): remote draft server bind + verify connect addr.
-DRAFT_BIND="${DRAFT_BIND:-tcp://0.0.0.0:50051}"
-DRAFT_ADDR="${DRAFT_ADDR:-tcp://127.0.0.1:50051}"
+# Disagg-DFlash (V*SD*): ZMQ control-plane endpoint (speculate RPC / draft tokens).
+# --draft-comm ipc|tcp selects the default bind/connect URLs (overridable via
+# --draft-bind / --draft-addr). tcp://127.0.0.1 may use OS/ZMQ loopback shm.
+DRAFT_COMM="${DRAFT_COMM:-ipc}"
+DRAFT_ZMQ_PORT="${DRAFT_ZMQ_PORT:-50051}"
+DRAFT_IPC_PATH="${DRAFT_IPC_PATH:-/tmp/vllm_dflash_draft.ipc}"
+DRAFT_BIND="${DRAFT_BIND:-}"
+DRAFT_ADDR="${DRAFT_ADDR:-}"
 DISAGG_DFLASH_TRANSPORT="${DISAGG_DFLASH_TRANSPORT:-nixl}"
 WAVE_SIZE="${WAVE_SIZE:-}"
 WAVE_SCHEDULE=1
@@ -73,7 +85,7 @@ CASES=(
   PD2SD1 PD4SD1
   P1_D1 P2_D2
   P1_D1SD1 P2_D2SD2 P2_D2SD1
-  V1SD1 V2SD1
+  V1SD1 V2SD1 V4SD1
 )
 BATCHED_SWEEP=(4096 8192 16384)
 
@@ -93,8 +105,11 @@ Options:
   --draft-devices IDS      GPUs for Disagg-DFlash draft server (V*SD*)
   --prefill-port PORT      Prefill HTTP port (default 8100)
   --decode-port PORT       Decode HTTP port (default 8200)
-  --draft-bind ADDR        Draft server bind (default tcp://0.0.0.0:50051)
-  --draft-addr ADDR        Verify→draft connect addr (default tcp://127.0.0.1:50051)
+  --draft-bind ADDR        Draft server bind (default from --draft-comm)
+  --draft-addr ADDR        Verify→draft connect addr (default from --draft-comm)
+  --draft-comm MODE        ZMQ endpoint mode: ipc (default) or tcp.
+                           ipc → ipc:///tmp/vllm_dflash_draft.ipc
+                           tcp → tcp://127.0.0.1:50051 (loopback; may use shm)
   --wave-size N            disagg_dflash_wave_size (omit = ceil(ready/2))
   --no-wave-schedule       disagg_dflash_wave_schedule=false
   --no-disagg-async        disagg_dflash_async_complete=false (sync propose)
@@ -130,7 +145,8 @@ Logs:
 Env overrides:
   MODEL DRAFT_MODEL NUM_SPEC_TOKENS GPU_MEM_UTIL MAX_NUM_SEQS MAX_MODEL_LEN
   BLOCK_SIZE NIXL_PREFILL_PORT NIXL_DECODE_PORT LOG_DIR PROXY_WAIT_TIMEOUT
-  DRAFT_BIND DRAFT_ADDR DISAGG_DFLASH_TRANSPORT WAVE_SIZE
+  DRAFT_BIND DRAFT_ADDR DRAFT_COMM DRAFT_ZMQ_PORT DRAFT_IPC_PATH
+  DISAGG_DFLASH_TRANSPORT WAVE_SIZE
 EOF
 }
 
@@ -141,8 +157,24 @@ list_matrix() {
   echo "Batched-token sweep values: ${BATCHED_SWEEP[*]}"
   echo "Full tag form: <CASE>_b<BATCHED>  e.g. PD2SD1_b8192  or  V1SD1_b8192"
   echo
+  echo "Colocated SD examples:"
+  echo "  ./launch_bench_server.sh PD1SD1_b8192 --devices 0 --port 8000 \\"
+  echo "      --no-async-scheduling --enable-logging-iteration-details --enable-disagg-profile"
+  echo "  ./launch_bench_server.sh PD2SD1_b8192 --devices 0,1 --port 8000 \\"
+  echo "      --no-async-scheduling --enable-logging-iteration-details --enable-disagg-profile"
+  echo "  ./launch_bench_server.sh PD4SD1_b8192 --devices 0,1,2,3 --port 8000 \\"
+  echo "      --no-async-scheduling --enable-logging-iteration-details --enable-disagg-profile"
+  echo
   echo "Disagg-DFlash: V{verify_tp}SD{draft_gpus}_bN  (remote draft via NIXL)"
-  echo "  e.g. ./launch_bench_server.sh V1SD1_b8192 --devices 0 --draft-devices 1"
+  echo "  ./launch_bench_server.sh V1SD1_b8192 --devices 0 --draft-devices 1 --port 8000 \\"
+  echo "      --no-wave-schedule --no-disagg-async --no-async-scheduling \\"
+  echo "      --enable-logging-iteration-details --nixl-log-every 0 --enable-disagg-profile"
+  echo "  ./launch_bench_server.sh V2SD1_b8192 --devices 0,1 --draft-devices 2 --port 8000 \\"
+  echo "      --no-wave-schedule --no-disagg-async --no-async-scheduling \\"
+  echo "      --enable-logging-iteration-details --nixl-log-every 0 --enable-disagg-profile"
+  echo "  ./launch_bench_server.sh V4SD1_b8192 --devices 0,1,2,3 --draft-devices 4 --port 8000 \\"
+  echo "      --no-wave-schedule --no-disagg-async --no-async-scheduling \\"
+  echo "      --enable-logging-iteration-details --nixl-log-every 0 --enable-disagg-profile"
   echo
   echo "=== Full sweep (case × batched) ==="
   for c in "${CASES[@]}"; do
@@ -235,6 +267,29 @@ default_sd_disagg_devices() {
   for ((i = 0; i < dgpus; i++)); do d_ids+=("$((vtp + i))"); done
   VERIFY_DEVICES_DEFAULT=$(IFS=,; echo "${v_ids[*]}")
   DRAFT_DEVICES_DEFAULT=$(IFS=,; echo "${d_ids[*]}")
+}
+
+resolve_draft_endpoints() {
+  # Fill DRAFT_BIND / DRAFT_ADDR from --draft-comm unless explicitly set.
+  local comm
+  comm=$(echo "${DRAFT_COMM}" | tr '[:upper:]' '[:lower:]')
+  case "$comm" in
+    ipc)
+      # ipc:///path — three slashes (empty host + absolute path).
+      DRAFT_BIND="${DRAFT_BIND:-ipc://${DRAFT_IPC_PATH}}"
+      DRAFT_ADDR="${DRAFT_ADDR:-ipc://${DRAFT_IPC_PATH}}"
+      ;;
+    tcp)
+      # Bind+connect on 127.0.0.1 (not 0.0.0.0): ZMQ/docs note loopback
+      # can use shared-memory transport and avoid the full TCP stack.
+      DRAFT_BIND="${DRAFT_BIND:-tcp://127.0.0.1:${DRAFT_ZMQ_PORT}}"
+      DRAFT_ADDR="${DRAFT_ADDR:-tcp://127.0.0.1:${DRAFT_ZMQ_PORT}}"
+      ;;
+    *)
+      die "--draft-comm must be 'ipc' or 'tcp' (got '${DRAFT_COMM}')"
+      ;;
+  esac
+  DRAFT_COMM="$comm"
 }
 
 count_csv() {
@@ -403,6 +458,7 @@ while [[ $# -gt 0 ]]; do
     --decode-port) DECODE_PORT="${2:?}"; shift 2 ;;
     --draft-bind) DRAFT_BIND="${2:?}"; shift 2 ;;
     --draft-addr) DRAFT_ADDR="${2:?}"; shift 2 ;;
+    --draft-comm) DRAFT_COMM="${2:?}"; shift 2 ;;
     --wave-size) WAVE_SIZE="${2:?}"; shift 2 ;;
     --no-wave-schedule) WAVE_SCHEDULE=0; shift ;;
     --no-disagg-async) DISAGG_ASYNC=0; shift ;;
@@ -445,7 +501,14 @@ fi
 # Recompute tag with resolved batched
 TAG="${CASE_BASE}_b${BATCHED}"
 
+if [[ "$MODE" == "sd_disagg" ]]; then
+  resolve_draft_endpoints
+fi
+
 echo "# case=${CASE_BASE}  tag=${TAG}  mode=${MODE}  batched=${BATCHED}"
+if [[ "$MODE" == "sd_disagg" ]]; then
+  echo "# draft-comm=${DRAFT_COMM}  bind=${DRAFT_BIND}  addr=${DRAFT_ADDR}"
+fi
 
 # ---------- build + launch ----------
 COMMON=()
