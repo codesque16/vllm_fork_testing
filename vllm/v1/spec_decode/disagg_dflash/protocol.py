@@ -102,6 +102,8 @@ class DisaggDFlashSpeculateRequest:
     seeds: torch.Tensor  # [num_reqs]
     num_speculative_tokens: int
     payload_mode: str = PAYLOAD_ZMQ
+    # Ping-pong NIXL/IPC slot index (0 or 1). Ignored for ZMQ payload mode.
+    staging_slot: int = 0
 
     def encode(self) -> list[bytes]:
         if self.payload_mode in _OFFWIRE_PAYLOAD_MODES:
@@ -122,6 +124,7 @@ class DisaggDFlashSpeculateRequest:
             "payload_mode": PAYLOAD_ZMQ,
             "req_ids": self.req_ids,
             "num_speculative_tokens": self.num_speculative_tokens,
+            "staging_slot": int(self.staging_slot),
             "tensors": [_tensor_meta(k, v) for k, v in tensors.items()],
         }
         frames = [msgpack.encode(meta)]
@@ -144,6 +147,7 @@ class DisaggDFlashSpeculateRequest:
             if self.context_hiddens.ndim == 2
             else 0,
             "num_reqs": len(self.req_ids),
+            "staging_slot": int(self.staging_slot),
             "tensors": [_tensor_meta(k, v) for k, v in tensors.items()],
         }
         frames = [msgpack.encode(meta)]
@@ -196,6 +200,7 @@ class DisaggDFlashSpeculateRequest:
             seeds=tensors["seeds"],
             num_speculative_tokens=int(meta["num_speculative_tokens"]),
             payload_mode=payload_mode,
+            staging_slot=int(meta.get("staging_slot", 0)),
         )
 
 

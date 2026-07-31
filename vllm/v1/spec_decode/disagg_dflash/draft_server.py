@@ -107,9 +107,10 @@ def run_draft_server(
             )
         if mode == PAYLOAD_NIXL:
             staging = engine.ensure_nixl_staging()
-            # Verify already NIXL-WRITEs into this registered buffer.
+            # Verify already NIXL-WRITEs into the ping-pong slot named in meta.
             n_ctx = int(meta["num_ctx_tokens"])
-            hiddens = staging.take_hiddens(n_ctx)
+            slot = int(meta.get("staging_slot", 0))
+            hiddens = staging.take_hiddens(n_ctx, staging_slot=slot)
             return DisaggDFlashSpeculateRequest.decode(
                 frames, context_hiddens=hiddens
             )

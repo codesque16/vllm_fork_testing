@@ -1812,8 +1812,9 @@ class DisaggDFlashDraftEngine:
             device=self.device,
         )
         logger.info(
-            "Disagg-DFlash draft: NIXL staging ready "
-            "(max_tokens=%d max_seqs=%d H=%d K=%d dtype=%s)",
+            "Disagg-DFlash draft: NIXL ping-pong staging ready "
+            "(slots=%d max_tokens=%d max_seqs=%d H=%d K=%d dtype=%s)",
+            self._nixl_staging.num_slots,
             self.ipc_max_num_tokens,
             self.max_num_seqs,
             h,

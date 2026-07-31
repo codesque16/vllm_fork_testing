@@ -11,6 +11,10 @@ Verify posts the NIXL WRITE in ``speculate_begin`` without waiting for DONE,
 so HS DMA can overlap post-sample / next-step work; ``speculate_wait`` joins
 the transfer before sending ZMQ meta (draft must see remote staging first).
 
+Ping-pong: two registered staging slots on each side. Verify can post WRITE
+into slot B while draft still consumes slot A (ZMQ reply in flight). Slot id
+travels in the ZMQ speculate meta (``staging_slot``).
+
 Handshake agent metadata is exchanged over the existing Disagg-DFlash ZMQ
 HELLO (no separate NIXL listen-thread side channel).
 """
@@ -19,10 +23,15 @@ from __future__ import annotations
 
 import base64
 import os
+import threading
 import time
+from collections import deque
 from typing import Any
 
 import torch
+
+# Dual staging arenas (ping-pong). Depth matches max in-flight WRITEs.
+NUM_STAGING_SLOTS = 2
 
 from vllm.distributed.nixl_utils import NixlWrapper, is_nixl_available, nixl_agent_config
 from vllm.logger import init_logger
@@ -135,7 +144,11 @@ def _make_agent(name: str) -> Any:
 
 
 class NixlStaging:
-    """Draft-owned NIXL-registered VRAM buffer for ``context_hiddens``."""
+    """Draft-owned ping-pong NIXL-registered VRAM buffers for ``context_hiddens``.
+
+    Two independent arenas so verify can WRITE into slot B while draft still
+    reads slot A. Each slot is registered separately with NIXL.
+    """
 
     def __init__(
         self,
@@ -146,49 +159,73 @@ class NixlStaging:
         num_speculative_tokens: int,
         dtype: torch.dtype,
         device: torch.device,
+        num_slots: int = NUM_STAGING_SLOTS,
     ):
         if max_tokens < 1 or max_num_seqs < 1 or hidden_size < 1:
             raise ValueError("Invalid NIXL staging sizes")
+        if num_slots < 1:
+            raise ValueError("num_slots must be >= 1")
         self.max_tokens = max_tokens
         self.max_num_seqs = max_num_seqs
         self.hidden_size = hidden_size
         self.num_speculative_tokens = num_speculative_tokens
         self.dtype = dtype
         self.device = device
+        self.num_slots = int(num_slots)
 
-        self.hidden_staging = torch.zeros(
-            max_tokens, hidden_size, dtype=dtype, device=device
-        )
         self._hidden_nbytes = int(
             max_tokens * hidden_size * _dtype_nbytes(dtype)
         )
-        self.device_id = int(self.hidden_staging.get_device())
-        self.hidden_addr = int(self.hidden_staging.data_ptr())
+        self.buffers: list[torch.Tensor] = [
+            torch.zeros(max_tokens, hidden_size, dtype=dtype, device=device)
+            for _ in range(self.num_slots)
+        ]
+        self.device_id = int(self.buffers[0].get_device())
+        self.hidden_addrs = [int(buf.data_ptr()) for buf in self.buffers]
+        # Backward-compat aliases (slot 0).
+        self.hidden_staging = self.buffers[0]
+        self.hidden_addr = self.hidden_addrs[0]
 
         self._agent = _make_agent(_DRAFT_AGENT_NAME)
-        # P/D-style registration: tensor → NIXL reg list.
-        self._reg = self._agent.register_memory(self.hidden_staging)
-        if not self._reg:
-            raise RuntimeError("Disagg-DFlash draft NIXL register_memory failed")
+        self._regs: list[Any] = []
+        for buf in self.buffers:
+            reg = self._agent.register_memory(buf)
+            if not reg:
+                raise RuntimeError(
+                    "Disagg-DFlash draft NIXL register_memory failed"
+                )
+            self._regs.append(reg)
         self._peer_name: str | None = None
         self._recv_count = 0
         self._nixl_log_every = _nixl_log_every()
+        logger.info(
+            "Disagg-DFlash draft NIXL ping-pong staging: slots=%d "
+            "max_tokens=%d H=%d nbytes/slot=%.1fMiB",
+            self.num_slots,
+            self.max_tokens,
+            self.hidden_size,
+            self._hidden_nbytes / (1024**2),
+        )
 
     def add_remote_verify(self, agent_metadata: bytes) -> str:
         """Register verify agent (bidirectional metadata like P/D handshake)."""
         self._peer_name = self._agent.add_remote_agent(agent_metadata)
         return self._peer_name
 
-    def take_hiddens(self, num_ctx_tokens: int) -> torch.Tensor:
-        """Return ``[:num_ctx]`` view after verify NIXL WRITE completed."""
+    def take_hiddens(
+        self, num_ctx_tokens: int, staging_slot: int = 0
+    ) -> torch.Tensor:
+        """Return ``buffers[slot][:num_ctx]`` view after verify NIXL WRITE."""
+        slot = int(staging_slot)
+        if slot < 0 or slot >= self.num_slots:
+            raise ValueError(
+                f"staging_slot={slot} out of range [0, {self.num_slots})"
+            )
         n = int(num_ctx_tokens)
         if n < 0 or n > self.max_tokens:
             raise ValueError(f"num_ctx_tokens={n} out of range")
         # NIXL DONE on verify implies remote visibility; fence the draft stream so
         # subsequent draft kernels see the written bytes (correctness, always).
-        # Logging below is optional and does not add an extra CUDA sync.
-        # There is no NIXL READ op on this path — verify WRITEs into this
-        # buffer; draft-side log is the receiver/"read" view of that WRITE.
         t0 = time.perf_counter()
         if n > 0 and self.device.type == "cuda":
             torch.cuda.current_stream(self.device).synchronize()
@@ -199,13 +236,14 @@ class NixlStaging:
         if every >= 0 and (every == 0 or self._recv_count % max(1, every) == 0):
             logger.info(
                 "Disagg-DFlash xfer target→draft (NIXL WRITE recv/draft-side n=%d): "
-                "bytes=%.1fKB n_ctx=%d | fence_us=%.1f",
+                "bytes=%.1fKB n_ctx=%d slot=%d | fence_us=%.1f",
                 self._recv_count,
                 nbytes / 1024.0,
                 n,
+                slot,
                 fence_us,
             )
-        return self.hidden_staging[:n]
+        return self.buffers[slot][:n]
 
     def hello_payload(self) -> dict[str, Any]:
         return {
@@ -216,8 +254,12 @@ class NixlStaging:
             "num_speculative_tokens": self.num_speculative_tokens,
             "dtype": str(self.dtype).removeprefix("torch."),
             "agent_metadata": _b64(self._agent.get_agent_metadata()),
-            "hidden_addr": self.hidden_addr,
+            # Slot 0 aliases for older clients.
+            "hidden_addr": self.hidden_addrs[0],
             "hidden_nbytes": self._hidden_nbytes,
+            # Ping-pong: list of per-slot base addresses (same nbytes each).
+            "num_slots": self.num_slots,
+            "hidden_addrs": list(self.hidden_addrs),
             "device_id": self.device_id,
             "mem_type": _MEM_TYPE,
             "draft_tokens_payload": "zmq",
@@ -225,16 +267,27 @@ class NixlStaging:
 
     def close(self) -> None:
         try:
-            if self._agent is not None and self._reg is not None:
-                self._agent.deregister_memory(self._reg)
+            if self._agent is not None:
+                for reg in self._regs:
+                    try:
+                        self._agent.deregister_memory(reg)
+                    except Exception as e:
+                        logger.warning(
+                            "Disagg-DFlash draft NIXL deregister failed: %s", e
+                        )
         except Exception as e:
             logger.warning("Disagg-DFlash draft NIXL deregister failed: %s", e)
-        self._reg = None
+        self._regs = []
         self._agent = None
 
 
 class NixlClientTransport(DisaggDFlashClientTransport):
-    """Verify TP0: NIXL WRITE for hiddens; ZMQ for control + draft token ids."""
+    """Verify TP0: NIXL WRITE for hiddens; ZMQ for control + draft token ids.
+
+    Supports ping-pong staging: up to ``num_slots`` WRITEs may be posted before
+    the matching ZMQ speculate round-trips complete (FIFO). ``speculate_begin``
+    is safe to call while a prior ``speculate_wait`` is blocked on ZMQ recv.
+    """
 
     def __init__(
         self,
@@ -253,16 +306,24 @@ class NixlClientTransport(DisaggDFlashClientTransport):
         self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
         self._agent: Any = None
         self._peer_name: str | None = None
-        self._local_buf: torch.Tensor | None = None
-        self._local_reg: Any = None
-        self._staging_ready = torch.cuda.Event(enable_timing=False)
-        self._remote_addr = 0
+        self._num_slots = NUM_STAGING_SLOTS
+        self._local_bufs: list[torch.Tensor] = []
+        self._local_regs: list[Any] = []
+        self._staging_ready: list[torch.cuda.Event] = []
+        self._remote_addrs: list[int] = []
         self._remote_device_id = 0
         self._remote_nbytes = 0
         self._mem_type = _MEM_TYPE
         self._timeout_s = max(timeout_ms / 1000.0, 1.0)
         self.last_timings_ms: dict[str, float] = {}
-        self._inflight: dict[str, Any] | None = None
+        # FIFO of in-flight WRITEs / pending ZMQ round-trips (max num_slots).
+        self._inflight_q: deque[dict[str, Any]] = deque()
+        self._free_slots: deque[int] = deque()
+        # Protects slot alloc + inflight queue; not held across ZMQ recv.
+        self._slot_lock = threading.Lock()
+        # Serializes NIXL agent post/join (not held across ZMQ recv so the
+        # other ping-pong slot can be filled while draft computes).
+        self._xfer_lock = threading.Lock()
         # Rolling NIXL telemetry (P/D-style): accumulate then log averages.
         self._xfer_count = 0
         self._reply_count = 0
@@ -271,6 +332,14 @@ class NixlClientTransport(DisaggDFlashClientTransport):
         self._sum_e2e_us = 0.0
         self._sum_bytes = 0.0
         self._nixl_log_every = _nixl_log_every()
+
+    @property
+    def num_slots(self) -> int:
+        return self._num_slots
+
+    def inflight_depth(self) -> int:
+        with self._slot_lock:
+            return len(self._inflight_q)
 
     def _should_log_xfer(self, count: int) -> bool:
         every = self._nixl_log_every
@@ -448,29 +517,54 @@ class NixlClientTransport(DisaggDFlashClientTransport):
         self._k = int(meta["num_speculative_tokens"])
         dtype_name = str(meta.get("dtype", "bfloat16"))
         self._dtype = getattr(torch, dtype_name, torch.bfloat16)
-        self._remote_addr = int(meta["hidden_addr"])
         self._remote_nbytes = int(meta["hidden_nbytes"])
         self._remote_device_id = int(meta["device_id"])
         self._mem_type = str(meta.get("mem_type", _MEM_TYPE))
 
-        self._local_buf = torch.zeros(
-            self._max_tokens,
-            self._hidden_size,
-            dtype=self._dtype,
-            device=self.device,
-        )
-        self._local_reg = self._agent.register_memory(self._local_buf)
-        if not self._local_reg:
-            raise RuntimeError("Disagg-DFlash verify NIXL register_memory failed")
+        # Prefer ping-pong addr list; fall back to single hidden_addr.
+        addrs = meta.get("hidden_addrs")
+        if isinstance(addrs, list) and len(addrs) >= 1:
+            self._remote_addrs = [int(a) for a in addrs]
+            self._num_slots = len(self._remote_addrs)
+        else:
+            self._remote_addrs = [int(meta["hidden_addr"])]
+            self._num_slots = 1
+        # Cap at local ping-pong depth.
+        self._num_slots = min(self._num_slots, NUM_STAGING_SLOTS)
+        self._remote_addrs = self._remote_addrs[: self._num_slots]
+
+        self._local_bufs = []
+        self._local_regs = []
+        self._staging_ready = []
+        for _ in range(self._num_slots):
+            buf = torch.zeros(
+                self._max_tokens,
+                self._hidden_size,
+                dtype=self._dtype,
+                device=self.device,
+            )
+            reg = self._agent.register_memory(buf)
+            if not reg:
+                raise RuntimeError(
+                    "Disagg-DFlash verify NIXL register_memory failed"
+                )
+            self._local_bufs.append(buf)
+            self._local_regs.append(reg)
+            self._staging_ready.append(
+                torch.cuda.Event(enable_timing=False)
+            )
+        self._free_slots = deque(range(self._num_slots))
+        self._inflight_q.clear()
 
         self._handshook = True
         logger.info(
             "Disagg-DFlash NIXL handshake ok: max_tokens=%d max_seqs=%d H=%d K=%d "
-            "peer=%s (draft_tokens via ZMQ)",
+            "slots=%d peer=%s (draft_tokens via ZMQ, ping-pong)",
             self._max_tokens,
             self._max_num_seqs,
             self._hidden_size,
             self._k,
+            self._num_slots,
             self._peer_name,
         )
 
@@ -481,22 +575,17 @@ class NixlClientTransport(DisaggDFlashClientTransport):
         return self.speculate_wait()
 
     def speculate_begin(self, request: DisaggDFlashSpeculateRequest) -> None:
-        """Kick NIXL WRITE (non-blocking); ZMQ meta is deferred until wait.
+        """Kick NIXL WRITE into a free ping-pong slot (non-blocking).
 
-        Staging copy is synced, then ``transfer()`` is posted without waiting
-        for DONE so verify post-sample / next-step work can overlap the HS
-        DMA. ``speculate_wait`` joins the WRITE, then sends ZMQ meta (draft
-        must not start until remote staging is visible), then recv tokens.
+        Safe to call while a prior ``speculate_wait`` is blocked on ZMQ recv —
+        that is the point of ping-pong: fill slot B while draft holds slot A.
         """
         if not self._handshook:
             self.handshake()
         assert self._agent is not None
-        assert self._local_buf is not None
         assert self._peer_name is not None
-        if getattr(self, "_inflight", None) is not None:
-            raise RuntimeError(
-                "Disagg-DFlash NIXL speculate_begin while a transfer is in flight"
-            )
+        if not self._local_bufs:
+            raise RuntimeError("Disagg-DFlash NIXL local staging not initialized")
 
         profile = _profile_enabled()
         t0 = time.perf_counter() if profile else 0.0
@@ -524,43 +613,59 @@ class NixlClientTransport(DisaggDFlashClientTransport):
                 f"Hidden size mismatch: verify H={h}, draft staging H={self._hidden_size}"
             )
 
+        with self._slot_lock:
+            if not self._free_slots:
+                raise RuntimeError(
+                    "Disagg-DFlash NIXL: no free ping-pong staging slot "
+                    f"(depth={self._num_slots}, inflight={len(self._inflight_q)})"
+                )
+            slot = int(self._free_slots.popleft())
+
+        local_buf = self._local_bufs[slot]
+        ready_evt = self._staging_ready[slot]
+        remote_addr = self._remote_addrs[slot]
+
         nbytes = n_ctx * self._hidden_size * hiddens.element_size()
-        if n_ctx > 0:
-            # Copy into NIXL-registered staging; sync only the copy event
-            # (not the whole device) before the host-driven WRITE.
-            self._local_buf[:n_ctx].copy_(hiddens, non_blocking=True)
-            self._staging_ready.record(torch.cuda.current_stream(self.device))
-            self._staging_ready.synchronize()
-
-        t1 = time.perf_counter()
-
         handle = None
         t_xfer0 = 0.0
-        if nbytes > 0:
-            local_dev = int(self._local_buf.get_device())
-            local_descs = self._agent.get_xfer_descs(
-                [(int(self._local_buf.data_ptr()), nbytes, local_dev)],
-                mem_type=self._mem_type,
-            )
-            remote_descs = self._agent.get_xfer_descs(
-                [(self._remote_addr, nbytes, self._remote_device_id)],
-                mem_type=self._mem_type,
-            )
-            # Post WRITE and return; join in speculate_wait so DMA overlaps
-            # verify-side work after fire.
-            t_xfer0 = time.perf_counter()
-            handle = self._agent.initialize_xfer(
-                "WRITE",
-                local_descs,
-                remote_descs,
-                self._peer_name,
-                b"",
-            )
-            st = self._agent.transfer(handle)
-            if st == "ERR":
-                self._agent.release_xfer_handle(handle)
-                raise RuntimeError("Disagg-DFlash NIXL WRITE transfer failed")
-            # st may be DONE immediately for tiny payloads; still finish in wait.
+        try:
+            with self._xfer_lock:
+                if n_ctx > 0:
+                    local_buf[:n_ctx].copy_(hiddens, non_blocking=True)
+                    ready_evt.record(torch.cuda.current_stream(self.device))
+                    ready_evt.synchronize()
+
+                t1 = time.perf_counter()
+
+                if nbytes > 0:
+                    local_dev = int(local_buf.get_device())
+                    local_descs = self._agent.get_xfer_descs(
+                        [(int(local_buf.data_ptr()), nbytes, local_dev)],
+                        mem_type=self._mem_type,
+                    )
+                    remote_descs = self._agent.get_xfer_descs(
+                        [(remote_addr, nbytes, self._remote_device_id)],
+                        mem_type=self._mem_type,
+                    )
+                    t_xfer0 = time.perf_counter()
+                    handle = self._agent.initialize_xfer(
+                        "WRITE",
+                        local_descs,
+                        remote_descs,
+                        self._peer_name,
+                        b"",
+                    )
+                    st = self._agent.transfer(handle)
+                    if st == "ERR":
+                        self._agent.release_xfer_handle(handle)
+                        handle = None
+                        raise RuntimeError(
+                            "Disagg-DFlash NIXL WRITE transfer failed"
+                        )
+        except Exception:
+            with self._slot_lock:
+                self._free_slots.append(slot)
+            raise
 
         nixl_req = DisaggDFlashSpeculateRequest(
             req_ids=request.req_ids,
@@ -575,33 +680,43 @@ class NixlClientTransport(DisaggDFlashClientTransport):
             seeds=request.seeds,
             num_speculative_tokens=request.num_speculative_tokens,
             payload_mode=PAYLOAD_NIXL,
+            staging_slot=slot,
         )
         t_kick = time.perf_counter()
 
         k = int(request.num_speculative_tokens)
-        self._inflight = {
-            "num_reqs": num_reqs,
-            "k": k,
-            "n_ctx": n_ctx,
-            "nbytes": nbytes,
-            "profile": profile,
-            "t0": t0,
-            "t1": t1,
-            "t_kick": t_kick,
-            "t_xfer0": t_xfer0,
-            "handle": handle,
-            "nixl_req": nixl_req,
-        }
+        with self._slot_lock:
+            self._inflight_q.append(
+                {
+                    "slot": slot,
+                    "num_reqs": num_reqs,
+                    "k": k,
+                    "n_ctx": n_ctx,
+                    "nbytes": nbytes,
+                    "profile": profile,
+                    "t0": t0,
+                    "t1": t1,
+                    "t_kick": t_kick,
+                    "t_xfer0": t_xfer0,
+                    "handle": handle,
+                    "nixl_req": nixl_req,
+                }
+            )
 
     def speculate_wait(self) -> DisaggDFlashSpeculateResponse:
-        """Join NIXL WRITE, send ZMQ meta, then recv draft token ids."""
-        inflight = getattr(self, "_inflight", None)
-        if inflight is None:
-            raise RuntimeError(
-                "Disagg-DFlash NIXL speculate_wait without speculate_begin"
-            )
-        self._inflight = None
+        """Join oldest NIXL WRITE, send ZMQ meta (with slot), recv draft tokens.
 
+        Slot is returned to the free pool only after the ZMQ reply (draft has
+        finished consuming that staging arena).
+        """
+        with self._slot_lock:
+            if not self._inflight_q:
+                raise RuntimeError(
+                    "Disagg-DFlash NIXL speculate_wait without speculate_begin"
+                )
+            inflight = self._inflight_q.popleft()
+
+        slot = int(inflight["slot"])
         num_reqs = int(inflight["num_reqs"])
         k = int(inflight["k"])
         n_ctx = int(inflight["n_ctx"])
@@ -613,92 +728,106 @@ class NixlClientTransport(DisaggDFlashClientTransport):
 
         xfer_timings: dict[str, float] = {}
         t2 = time.perf_counter()
-        if handle is not None:
-            try:
-                st = self._agent.check_xfer_state(handle)
-                if st == "ERR":
-                    raise RuntimeError("Disagg-DFlash NIXL WRITE entered ERR state")
-                if st != "DONE":
-                    _wait_xfer_done(self._agent, handle, timeout_s=self._timeout_s)
-                t2 = time.perf_counter()
-                e2e_us = (t2 - float(inflight["t_xfer0"])) * 1e6
-                # Must read telemetry before release (P/D NixlConnector pattern).
-                telemetry = _read_xfer_telemetry(self._agent, handle)
-                xfer_timings = self._record_and_maybe_log_xfer(
-                    nbytes=nbytes,
-                    e2e_us=e2e_us,
-                    telemetry=telemetry,
-                    n_ctx=n_ctx,
-                    num_reqs=num_reqs,
+        try:
+            with self._xfer_lock:
+                if handle is not None:
+                    try:
+                        st = self._agent.check_xfer_state(handle)
+                        if st == "ERR":
+                            raise RuntimeError(
+                                "Disagg-DFlash NIXL WRITE entered ERR state"
+                            )
+                        if st != "DONE":
+                            _wait_xfer_done(
+                                self._agent, handle, timeout_s=self._timeout_s
+                            )
+                        t2 = time.perf_counter()
+                        e2e_us = (t2 - float(inflight["t_xfer0"])) * 1e6
+                        telemetry = _read_xfer_telemetry(self._agent, handle)
+                        xfer_timings = self._record_and_maybe_log_xfer(
+                            nbytes=nbytes,
+                            e2e_us=e2e_us,
+                            telemetry=telemetry,
+                            n_ctx=n_ctx,
+                            num_reqs=num_reqs,
+                        )
+                    finally:
+                        try:
+                            self._agent.release_xfer_handle(handle)
+                        except Exception as e:
+                            logger.warning(
+                                "Disagg-DFlash NIXL release_xfer_handle failed: %s",
+                                e,
+                            )
+
+            # Only notify draft after remote staging is visible (NIXL DONE).
+            # xfer_lock is released so begin can fill the other slot during recv.
+            frames = nixl_req.encode()
+            self._zmq.send(frames)
+            t_send = time.perf_counter()
+
+            t_recv0 = time.perf_counter()
+            resp_frames = self._zmq.recv()
+            t3 = time.perf_counter()
+            recv_us = (t3 - t_recv0) * 1e6
+            rtt_us = (t3 - t_send) * 1e6
+
+            resp = DisaggDFlashSpeculateResponse.decode(resp_frames)
+            out = resp.draft_tokens
+            if out.shape[0] < num_reqs or out.shape[1] < k:
+                raise RuntimeError(
+                    f"Disagg-DFlash draft token shape {tuple(out.shape)} "
+                    f"incompatible with num_reqs={num_reqs} K={k}"
                 )
-            finally:
-                try:
-                    self._agent.release_xfer_handle(handle)
-                except Exception as e:
-                    logger.warning(
-                        "Disagg-DFlash NIXL release_xfer_handle failed: %s", e
-                    )
-
-        # Only notify draft after remote staging is visible (NIXL DONE).
-        frames = nixl_req.encode()
-        self._zmq.send(frames)
-        t_send = time.perf_counter()
-
-        t_recv0 = time.perf_counter()
-        resp_frames = self._zmq.recv()
-        t3 = time.perf_counter()
-        recv_us = (t3 - t_recv0) * 1e6
-        rtt_us = (t3 - t_send) * 1e6
-
-        resp = DisaggDFlashSpeculateResponse.decode(resp_frames)
-        out = resp.draft_tokens
-        if out.shape[0] < num_reqs or out.shape[1] < k:
-            raise RuntimeError(
-                f"Disagg-DFlash draft token shape {tuple(out.shape)} "
-                f"incompatible with num_reqs={num_reqs} K={k}"
+            out = out[:num_reqs, :k].to(
+                device=self.device, dtype=torch.int64, non_blocking=True
             )
-        out = out[:num_reqs, :k].to(
-            device=self.device, dtype=torch.int64, non_blocking=True
-        )
-        t4 = time.perf_counter() if profile else 0.0
+            t4 = time.perf_counter() if profile else 0.0
 
-        # Draft tokens are int64 [num_reqs, K] on the wire (+ msgpack meta).
-        token_nbytes = num_reqs * k * 8
-        self._maybe_log_draft_to_target(
-            num_reqs=num_reqs,
-            k=k,
-            token_nbytes=token_nbytes,
-            recv_us=recv_us,
-            rtt_us=rtt_us,
-        )
-
-        # Always surface transfer / ZMQ pieces for Tad (cheap wall clocks).
-        self.last_timings_ms = dict(xfer_timings) if isinstance(xfer_timings, dict) else {}
-        self.last_timings_ms["zmq_recv_ms"] = (t3 - t_send) * 1000.0
-        self.last_timings_ms["zmq_rtt_ms"] = (t3 - t2) * 1000.0
-        if profile:
-            t0 = float(inflight["t0"])
-            t1 = float(inflight["t1"])
-            t_kick = float(inflight["t_kick"])
-            self.last_timings_ms.update(
-                {
-                    "nixl_prep_ms": (t1 - t0) * 1000.0,
-                    "nixl_kick_ms": (t_kick - t1) * 1000.0,
-                    "nixl_write_ms": (t2 - float(inflight["t_xfer0"] or t_kick))
-                    * 1000.0
-                    if nbytes > 0
-                    else 0.0,
-                    "nixl_await_ms": (t2 - t_kick) * 1000.0,
-                    "zmq_send_ms": (t_send - t2) * 1000.0,
-                    "token_h2d_ms": (t4 - t3) * 1000.0,
-                    "nixl_total_ms": (t4 - t0) * 1000.0,
-                }
+            token_nbytes = num_reqs * k * 8
+            self._maybe_log_draft_to_target(
+                num_reqs=num_reqs,
+                k=k,
+                token_nbytes=token_nbytes,
+                recv_us=recv_us,
+                rtt_us=rtt_us,
             )
-        return DisaggDFlashSpeculateResponse(
-            draft_tokens=out,
-            payload_mode=PAYLOAD_ZMQ,
-            draft_forward_ms=resp.draft_forward_ms,
-        )
+
+            self.last_timings_ms = (
+                dict(xfer_timings) if isinstance(xfer_timings, dict) else {}
+            )
+            self.last_timings_ms["zmq_recv_ms"] = (t3 - t_send) * 1000.0
+            self.last_timings_ms["zmq_rtt_ms"] = (t3 - t2) * 1000.0
+            self.last_timings_ms["staging_slot"] = float(slot)
+            if profile:
+                t0 = float(inflight["t0"])
+                t1 = float(inflight["t1"])
+                t_kick = float(inflight["t_kick"])
+                self.last_timings_ms.update(
+                    {
+                        "nixl_prep_ms": (t1 - t0) * 1000.0,
+                        "nixl_kick_ms": (t_kick - t1) * 1000.0,
+                        "nixl_write_ms": (
+                            (t2 - float(inflight["t_xfer0"] or t_kick)) * 1000.0
+                            if nbytes > 0
+                            else 0.0
+                        ),
+                        "nixl_await_ms": (t2 - t_kick) * 1000.0,
+                        "zmq_send_ms": (t_send - t2) * 1000.0,
+                        "token_h2d_ms": (t4 - t3) * 1000.0,
+                        "nixl_total_ms": (t4 - t0) * 1000.0,
+                    }
+                )
+            return DisaggDFlashSpeculateResponse(
+                draft_tokens=out,
+                payload_mode=PAYLOAD_ZMQ,
+                draft_forward_ms=resp.draft_forward_ms,
+            )
+        finally:
+            # Free slot only after draft finished with that arena (ZMQ replied
+            # or this wait failed). Enables the next WRITE into this slot.
+            with self._slot_lock:
+                self._free_slots.append(slot)
 
     def free(self, request: DisaggDFlashFreeRequest) -> None:
         self._zmq.free(request)
@@ -708,11 +837,17 @@ class NixlClientTransport(DisaggDFlashClientTransport):
 
     def close(self) -> None:
         try:
-            if self._agent is not None and self._local_reg is not None:
-                self._agent.deregister_memory(self._local_reg)
+            if self._agent is not None:
+                for reg in self._local_regs:
+                    try:
+                        self._agent.deregister_memory(reg)
+                    except Exception as e:
+                        logger.warning(
+                            "Disagg-DFlash verify NIXL deregister failed: %s", e
+                        )
         except Exception as e:
             logger.warning("Disagg-DFlash verify NIXL deregister failed: %s", e)
-        self._local_reg = None
+        self._local_regs = []
+        self._local_bufs = []
         self._agent = None
-        self._local_buf = None
         self._zmq.close()

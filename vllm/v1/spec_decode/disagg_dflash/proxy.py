@@ -6,9 +6,14 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
+
+# Match NIXL ping-pong depth: allow a second fire while the first draft RPC
+# is still outstanding (WRITE into the other staging slot).
+_MAX_INFLIGHT_SPECULATES = 2
 
 import torch
 import torch.nn as nn
@@ -99,10 +104,10 @@ class DisaggDFlashProxy(BaseSpeculator):
             self._cross_step
             and getattr(self.speculative_config, "disagg_dflash_async_complete", True)
         )
-        # Cross-step: one in-flight speculate whose finish is deferred into the
-        # next execute_model (before FREE / prepare_inputs).
-        self._deferred_pending: DisaggProposePending | None = None
-        # Completed bg wait stashed for send-and-forget apply (pending, response).
+        # Cross-step: FIFO of in-flight speculates (depth ≤ ping-pong slots).
+        # Finish is deferred into a later execute_model (before FREE / prepare).
+        self._deferred_queue: deque[DisaggProposePending] = deque()
+        # Completed bg wait for the queue head (pending, response).
         self._completed: tuple[DisaggProposePending, Any] | None = None
         # Background ZMQ wait so draft RTT advances while the worker runs
         # post-sample work / DP sync. Socket access is serialized by the lock.
@@ -111,6 +116,7 @@ class DisaggDFlashProxy(BaseSpeculator):
             max_workers=1, thread_name_prefix="disagg-dflash-wait"
         )
         self._wait_future: Future[Any] | None = None
+        self._max_inflight = _MAX_INFLIGHT_SPECULATES
         # Req ids whose remote draft was applied since the last status poll
         # (consumed by DraftTokensHandler / scheduler).
         self._ready_req_ids: list[str] = []
@@ -165,12 +171,13 @@ class DisaggDFlashProxy(BaseSpeculator):
             self._client.handshake()
         logger.info(
             "Disagg-DFlash proxy ready (tp_rank=%d, address=%s, transport=%s, "
-            "cross_step=%s, async_complete=%s)",
+            "cross_step=%s, async_complete=%s, max_inflight=%d)",
             self._tp_rank,
             self.speculative_config.disagg_dflash_address,
             self._transport_name,
             self._cross_step,
             self._async_complete,
+            self._max_inflight,
         )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
@@ -246,8 +253,14 @@ class DisaggDFlashProxy(BaseSpeculator):
         except Exception as e:
             logger.warning("Disagg-DFlash FREE failed: %s", e)
 
+    def _queue_head(self) -> DisaggProposePending | None:
+        return self._deferred_queue[0] if self._deferred_queue else None
+
+    def _inflight_count(self) -> int:
+        return sum(1 for p in self._deferred_queue if not p.early_done)
+
     def _start_background_wait(self) -> None:
-        """Begin speculate_wait on a worker thread (cross-step only)."""
+        """Begin speculate_wait on a worker thread for the oldest pending."""
         if (
             not self._cross_step
             or self._tp_rank != 0
@@ -255,10 +268,15 @@ class DisaggDFlashProxy(BaseSpeculator):
             or self._wait_future is not None
         ):
             return
+        head = self._queue_head()
+        if head is None or head.early_done or head.response is not None:
+            return
         client = self._client
         lock = self._client_lock
 
         def _wait() -> Any:
+            # Lock serializes ZMQ; NIXL begin may still post WRITE into the
+            # other ping-pong slot concurrently (client slot_lock).
             with lock:
                 return client.speculate_wait()
 
@@ -286,7 +304,7 @@ class DisaggDFlashProxy(BaseSpeculator):
         """
         if self._completed is not None:
             return True
-        pending = self._deferred_pending
+        pending = self._queue_head()
         if pending is None or pending.early_done:
             return pending is not None and pending.early_done
         resp = self._take_background_wait(blocking=blocking)
@@ -310,11 +328,13 @@ class DisaggDFlashProxy(BaseSpeculator):
         return self._async_complete
 
     def inflight_req_ids(self) -> set[str]:
-        pending = self._deferred_pending
-        if pending is None or pending.early_done:
-            return set()
-        # Still in flight until applied (even if ZMQ reply is already stashed).
-        return set(pending.req_ids)
+        ids: set[str] = set()
+        for pending in self._deferred_queue:
+            if pending.early_done:
+                continue
+            # Still in flight until applied (even if ZMQ reply is stashed).
+            ids.update(pending.req_ids)
+        return ids
 
     def take_ready_req_ids(self) -> list[str]:
         ready = self._ready_req_ids
@@ -322,18 +342,13 @@ class DisaggDFlashProxy(BaseSpeculator):
         return ready
 
     def defer_pending(self, pending: DisaggProposePending) -> None:
-        """Hold fire-time pending until apply/drain completes it."""
-        if self._deferred_pending is not None and not self._deferred_pending.early_done:
+        """Hold fire-time pending until apply/drain completes it (FIFO)."""
+        if self._inflight_count() >= self._max_inflight:
             raise RuntimeError(
-                "Disagg-DFlash cross-step: new propose_begin while previous "
-                "speculate is still in flight"
+                "Disagg-DFlash cross-step: ping-pong depth exceeded "
+                f"(max_inflight={self._max_inflight})"
             )
-        if self._completed is not None:
-            raise RuntimeError(
-                "Disagg-DFlash cross-step: new propose_begin while previous "
-                "speculate completion is not yet applied"
-            )
-        self._deferred_pending = pending
+        self._deferred_queue.append(pending)
 
     def _apply_pending(
         self, pending: DisaggProposePending, req_states: Any | None
@@ -358,13 +373,13 @@ class DisaggDFlashProxy(BaseSpeculator):
         return applied
 
     def try_apply_completed(self, req_states: Any | None) -> list[str] | None:
-        """Non-blocking poll: apply draft if bg wait is done (TP-collective).
+        """Non-blocking poll: apply oldest draft if bg wait is done (TP-collective).
 
         All TP ranks must call this every step so the ready-bit broadcast and
         token broadcast stay matched. Returns applied req_ids, or None if the
         in-flight speculate is still outstanding / absent.
         """
-        pending = self._deferred_pending
+        pending = self._queue_head()
         ready = torch.zeros(1, dtype=torch.int32, device=self.device)
         if self._tp_rank == 0:
             if pending is None:
@@ -383,24 +398,33 @@ class DisaggDFlashProxy(BaseSpeculator):
             return None
         if pending is None:
             return None
-        self._deferred_pending = None
+        if self._deferred_queue and self._deferred_queue[0] is pending:
+            self._deferred_queue.popleft()
         self._completed = None
-        return self._apply_pending(pending, req_states)
+        applied = self._apply_pending(pending, req_states)
+        # Kick wait for the next ping-pong slot if one is already fired.
+        if self._tp_rank == 0:
+            self._start_background_wait()
+        return applied
 
     def drain_blocking(self, req_states: Any | None) -> list[str] | None:
-        """Block until the deferred speculate completes and apply it."""
-        pending = self._deferred_pending
+        """Block until the oldest deferred speculate completes and apply it."""
+        pending = self._queue_head()
         if pending is None:
             return None
         if self._tp_rank == 0 and not pending.early_done:
             self._poll_into_completed(blocking=True)
-        self._deferred_pending = None
+        if self._deferred_queue and self._deferred_queue[0] is pending:
+            self._deferred_queue.popleft()
         self._completed = None
-        return self._apply_pending(pending, req_states)
+        applied = self._apply_pending(pending, req_states)
+        if self._tp_rank == 0:
+            self._start_background_wait()
+        return applied
 
     def drain_deferred(self, req_states: Any | None) -> torch.Tensor | None:
         """Backward-compatible blocking drain; returns draft tensor or None."""
-        pending = self._deferred_pending
+        pending = self._queue_head()
         if pending is None:
             return None
         applied = self.drain_blocking(req_states)
@@ -549,13 +573,9 @@ class DisaggDFlashProxy(BaseSpeculator):
                 req_ids=req_ids_list,
             )
 
-        # One in-flight remote speculate: skip firing while a prior batch's
-        # draft RPC is still outstanding (async-complete packs other work).
-        if (
-            self._async_complete
-            and self._deferred_pending is not None
-            and not self._deferred_pending.early_done
-        ):
+        # Ping-pong: allow up to _max_inflight remote speculates. Skip only
+        # when both staging slots already have an outstanding RPC.
+        if self._async_complete and self._inflight_count() >= self._max_inflight:
             return DisaggProposePending(
                 num_reqs=num_reqs,
                 early_done=True,
