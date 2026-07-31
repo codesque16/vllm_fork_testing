@@ -41,6 +41,8 @@ WAVE_SCHEDULE=1
 DISAGG_ASYNC=1
 # Off by default: SD timing / Disagg profile use CUDA synchronize and skew TPOT.
 ENABLE_DISAGG_PROFILE=0
+# Upper-bound A/B: skip verify-side L*H→H projector (draft inputs wrong).
+NOOP_REDUCE=0
 # Live terminal + file under startup_logs/<tag>_<role>_<timestamp>.log
 LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/startup_logs}"
 
@@ -95,6 +97,8 @@ Options:
   --no-disagg-async        disagg_dflash_async_complete=false (sync propose)
   --enable-disagg-profile  Opt-in SD timing + Disagg/DFlash profile logs
                            (CUDA sync — skews latency; off by default for benches)
+  --noop-reduce            Skip verify L*H→H projector (upper-bound timing A/B;
+                           wire uses last_hidden_states; keep synthetic accept)
   --proxy                  Also launch toy_proxy_server.py on --proxy-port
   --proxy-port PORT        Client-facing proxy port (default 8000)
   --proxy-script PATH      Override path to toy_proxy_server.py
@@ -244,19 +248,21 @@ spec_json_sd_disagg() {
   local wave_sched="true"
   local async_c="true"
   local profile="false"
+  local noop_reduce="false"
   local wave_size_json="null"
   [[ "$WAVE_SCHEDULE" -eq 1 ]] || wave_sched="false"
   [[ "$DISAGG_ASYNC" -eq 1 ]] || async_c="false"
   [[ "$ENABLE_DISAGG_PROFILE" -eq 1 ]] && profile="true"
+  [[ "$NOOP_REDUCE" -eq 1 ]] && noop_reduce="true"
   if [[ -n "$WAVE_SIZE" ]]; then
     wave_size_json="$WAVE_SIZE"
   fi
   # Same synthetic acceptance as colocated PD*SD* so paper A/B compares
   # latency/overlap, not draft quality.
-  printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"rejection_sample_method":"synthetic","synthetic_acceptance_rates":%s,"disagg_dflash_address":"%s","disagg_dflash_transport":"%s","disagg_dflash_cross_step":true,"disagg_dflash_async_complete":%s,"disagg_dflash_wave_schedule":%s,"disagg_dflash_wave_size":%s,"disagg_dflash_profile":%s,"attention_backend":"FLASH_ATTN"}' \
+  printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"rejection_sample_method":"synthetic","synthetic_acceptance_rates":%s,"disagg_dflash_address":"%s","disagg_dflash_transport":"%s","disagg_dflash_cross_step":true,"disagg_dflash_async_complete":%s,"disagg_dflash_wave_schedule":%s,"disagg_dflash_wave_size":%s,"disagg_dflash_profile":%s,"disagg_dflash_noop_reduce":%s,"attention_backend":"FLASH_ATTN"}' \
     "$DRAFT_MODEL" "$NUM_SPEC_TOKENS" "$SYNTH_RATES" \
     "$DRAFT_ADDR" "$DISAGG_DFLASH_TRANSPORT" \
-    "$async_c" "$wave_sched" "$wave_size_json" "$profile"
+    "$async_c" "$wave_sched" "$wave_size_json" "$profile" "$noop_reduce"
 }
 
 kv_json() {
@@ -396,6 +402,7 @@ while [[ $# -gt 0 ]]; do
     --no-wave-schedule) WAVE_SCHEDULE=0; shift ;;
     --no-disagg-async) DISAGG_ASYNC=0; shift ;;
     --enable-disagg-profile) ENABLE_DISAGG_PROFILE=1; shift ;;
+    --noop-reduce) NOOP_REDUCE=1; shift ;;
     --proxy-port) PROXY_PORT="${2:?}"; shift 2 ;;
     --proxy-script) PROXY_SCRIPT="${2:?}"; shift 2 ;;
     --log-dir) LOG_DIR="${2:?}"; shift 2 ;;
@@ -433,6 +440,7 @@ fi
 TAG="${CASE_BASE}_b${BATCHED}"
 
 echo "# case=${CASE_BASE}  tag=${TAG}  mode=${MODE}  batched=${BATCHED}"
+[[ "$NOOP_REDUCE" -eq 1 ]] && echo "# noop-reduce=1 (skip verify fc projector; timing A/B only)"
 
 # ---------- build + launch ----------
 COMMON=()

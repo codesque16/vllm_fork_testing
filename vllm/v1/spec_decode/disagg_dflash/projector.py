@@ -159,8 +159,16 @@ def reduce_aux_hidden_states(
     projector: nn.Module | None,
     last_hidden_states: torch.Tensor,
     aux_hidden_states: list[torch.Tensor] | None,
+    *,
+    noop: bool = False,
 ) -> torch.Tensor:
-    """Return ``[num_tokens, H]`` reduced context states for the wire."""
+    """Return ``[num_tokens, H]`` reduced context states for the wire.
+
+    When ``noop=True``, skip cat/projector entirely and return
+    ``last_hidden_states`` (upper-bound timing; draft inputs are wrong).
+    """
+    if noop:
+        return last_hidden_states
     if aux_hidden_states and projector is not None:
         cat = torch.cat(aux_hidden_states, dim=-1)
         return projector(cat)

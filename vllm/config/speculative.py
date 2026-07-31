@@ -139,6 +139,11 @@ class SpeculativeConfig:
     ``None`` → heuristic ``max(1, ceil(num_ready_decodes/2))`` when ≥2 ready."""
     disagg_dflash_profile: bool = False
     """Enable Disagg-DFlash verify-side profile logs (debug only)."""
+    disagg_dflash_noop_reduce: bool = False
+    """Skip verify-side L*H→H projector (no GEMM / TP collective).
+
+    For A/B upper-bound timing only: pack ``last_hidden_states`` as the wire
+    tensor. Draft quality is wrong; use with synthetic rejection sampling."""
 
     # Draft model configuration
     quantization: me_quant.QuantizationMethods | str | None = None

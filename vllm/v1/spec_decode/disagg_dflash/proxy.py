@@ -125,6 +125,10 @@ class DisaggDFlashProxy(BaseSpeculator):
         # --enable-sd-timing-model is on.
         self._last_tpv_ms: float = 0.0
         self._last_accepted: float = 0.0
+        # Upper-bound A/B: skip L*H→H projector compute / TP collectives.
+        self._noop_reduce = bool(
+            getattr(self.speculative_config, "disagg_dflash_noop_reduce", False)
+        )
 
         self.draft_tokens = torch.zeros(
             self.max_num_reqs,
@@ -146,7 +150,14 @@ class DisaggDFlashProxy(BaseSpeculator):
         self._last_accepted = float(accepted)
 
     def load_model(self, target_model: nn.Module) -> None:
-        self._projector = build_and_load_projector(self.vllm_config, self.device)
+        if self._noop_reduce:
+            self._projector = None
+            logger.warning(
+                "Disagg-DFlash: disagg_dflash_noop_reduce=True — skipping fc "
+                "projector; wire uses last_hidden_states (timing A/B only)."
+            )
+        else:
+            self._projector = build_and_load_projector(self.vllm_config, self.device)
         if self._tp_rank == 0:
             address = self.speculative_config.disagg_dflash_address
             assert address is not None
@@ -165,12 +176,13 @@ class DisaggDFlashProxy(BaseSpeculator):
             self._client.handshake()
         logger.info(
             "Disagg-DFlash proxy ready (tp_rank=%d, address=%s, transport=%s, "
-            "cross_step=%s, async_complete=%s)",
+            "cross_step=%s, async_complete=%s, noop_reduce=%s)",
             self._tp_rank,
             self.speculative_config.disagg_dflash_address,
             self._transport_name,
             self._cross_step,
             self._async_complete,
+            self._noop_reduce,
         )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
@@ -194,10 +206,12 @@ class DisaggDFlashProxy(BaseSpeculator):
         num_tokens: int,
     ) -> None:
         """Launch L*H→H projector on a side stream (overlaps with sample())."""
-        if self._projector is None:
+        if self._noop_reduce or self._projector is None:
+            # No-op / no projector: view only — no GEMM, no TP collective.
             self._proj_inflight = False
             self._proj_reduced = last_hidden_states[:num_tokens]
             self._proj_num_tokens = num_tokens
+            self._proj_t0 = 0.0
             return
         profile = _profile_enabled() and self._tp_rank == 0
         self._proj_t0 = time.perf_counter() if profile else 0.0
@@ -212,6 +226,7 @@ class DisaggDFlashProxy(BaseSpeculator):
                     if aux_hidden_states is not None
                     else None
                 ),
+                noop=False,
             )
         self._proj_ready.record(self._proj_stream)
         self._proj_inflight = True
@@ -627,8 +642,9 @@ class DisaggDFlashProxy(BaseSpeculator):
                     if aux_hidden_states is not None
                     else None
                 ),
+                noop=self._noop_reduce,
             )
-            if profile:
+            if profile and not self._noop_reduce:
                 torch.cuda.synchronize()
             t_proj1 = time.perf_counter() if profile else 0.0
         self._proj_reduced = None
