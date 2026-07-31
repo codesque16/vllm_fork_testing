@@ -10,8 +10,9 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import RowParallelLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 logger = init_logger(__name__)
@@ -21,14 +22,24 @@ class DFlashHiddenProjector(nn.Module):
     """Minimal module holding draft ``fc`` (and optional aux norms).
 
     Runs on the verify GPU so only reduced ``[N, H]`` hiddens cross the wire.
+    TP shards the L*H input dim via RowParallelLinear + all-reduce.
     """
 
     def __init__(self, input_size: int, output_size: int, dtype: torch.dtype):
         super().__init__()
-        self.fc = ReplicatedLinear(
+        tp_size = get_tensor_model_parallel_world_size()
+        if input_size % tp_size != 0:
+            raise ValueError(
+                f"Disagg-DFlash fc input_size={input_size} is not divisible by "
+                f"tensor_parallel_size={tp_size}. RowParallelLinear requires "
+                f"L*H % TP == 0."
+            )
+        self.fc = RowParallelLinear(
             input_size=input_size,
             output_size=output_size,
             bias=False,
+            input_is_parallel=False,
+            reduce_results=True,
             params_dtype=dtype,
             quant_config=None,
             prefix="disagg_dflash_fc",
@@ -133,9 +144,11 @@ def build_and_load_projector(
         )
     else:
         logger.info(
-            "Disagg-DFlash: loaded verify-side fc projector %s → %s from %s",
+            "Disagg-DFlash: loaded verify-side fc projector %s → %s "
+            "(RowParallel tp=%d) from %s",
             in_size,
             out_size,
+            get_tensor_model_parallel_world_size(),
             model_name,
         )
     return projector
