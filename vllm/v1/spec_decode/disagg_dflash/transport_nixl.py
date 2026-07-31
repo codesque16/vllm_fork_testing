@@ -7,6 +7,10 @@ move via NIXL (verify WRITE → draft-owned registered VRAM staging), matching
 the same split as ``cuda_ipc`` and the register / handshake / transfer / poll
 flow used by P/D ``NixlConnector`` and ``nixl_bw_sweep.py``.
 
+Verify posts the NIXL WRITE in ``speculate_begin`` without waiting for DONE,
+so HS DMA can overlap post-sample / next-step work; ``speculate_wait`` joins
+the transfer before sending ZMQ meta (draft must see remote staging first).
+
 Handshake agent metadata is exchanged over the existing Disagg-DFlash ZMQ
 HELLO (no separate NIXL listen-thread side channel).
 """
@@ -180,25 +184,26 @@ class NixlStaging:
         n = int(num_ctx_tokens)
         if n < 0 or n > self.max_tokens:
             raise ValueError(f"num_ctx_tokens={n} out of range")
-        # NIXL DONE on verify implies remote visibility; sync draft stream so
-        # subsequent draft kernels see the written bytes.
+        # NIXL DONE on verify implies remote visibility; fence the draft stream so
+        # subsequent draft kernels see the written bytes (correctness, always).
+        # Logging below is optional and does not add an extra CUDA sync.
         # There is no NIXL READ op on this path — verify WRITEs into this
         # buffer; draft-side log is the receiver/"read" view of that WRITE.
         t0 = time.perf_counter()
         if n > 0 and self.device.type == "cuda":
             torch.cuda.current_stream(self.device).synchronize()
-        sync_us = (time.perf_counter() - t0) * 1e6
+        fence_us = (time.perf_counter() - t0) * 1e6
         nbytes = n * self.hidden_size * _dtype_nbytes(self.dtype)
         self._recv_count += 1
         every = self._nixl_log_every
         if every >= 0 and (every == 0 or self._recv_count % max(1, every) == 0):
             logger.info(
                 "Disagg-DFlash xfer target→draft (NIXL WRITE recv/draft-side n=%d): "
-                "bytes=%.1fKB n_ctx=%d | sync_us=%.1f",
+                "bytes=%.1fKB n_ctx=%d | fence_us=%.1f",
                 self._recv_count,
                 nbytes / 1024.0,
                 n,
-                sync_us,
+                fence_us,
             )
         return self.hidden_staging[:n]
 
@@ -476,12 +481,22 @@ class NixlClientTransport(DisaggDFlashClientTransport):
         return self.speculate_wait()
 
     def speculate_begin(self, request: DisaggDFlashSpeculateRequest) -> None:
-        """WRITE hiddens over NIXL + send ZMQ meta; draft runs while caller overlaps."""
+        """Kick NIXL WRITE (non-blocking); ZMQ meta is deferred until wait.
+
+        Staging copy is synced, then ``transfer()`` is posted without waiting
+        for DONE so verify post-sample / next-step work can overlap the HS
+        DMA. ``speculate_wait`` joins the WRITE, then sends ZMQ meta (draft
+        must not start until remote staging is visible), then recv tokens.
+        """
         if not self._handshook:
             self.handshake()
         assert self._agent is not None
         assert self._local_buf is not None
         assert self._peer_name is not None
+        if getattr(self, "_inflight", None) is not None:
+            raise RuntimeError(
+                "Disagg-DFlash NIXL speculate_begin while a transfer is in flight"
+            )
 
         profile = _profile_enabled()
         t0 = time.perf_counter() if profile else 0.0
@@ -519,7 +534,8 @@ class NixlClientTransport(DisaggDFlashClientTransport):
 
         t1 = time.perf_counter()
 
-        xfer_timings: dict[str, float] = {}
+        handle = None
+        t_xfer0 = 0.0
         if nbytes > 0:
             local_dev = int(self._local_buf.get_device())
             local_descs = self._agent.get_xfer_descs(
@@ -530,7 +546,8 @@ class NixlClientTransport(DisaggDFlashClientTransport):
                 [(self._remote_addr, nbytes, self._remote_device_id)],
                 mem_type=self._mem_type,
             )
-            # Same one-shot pattern as nixl_bw_sweep (variable nbytes per step).
+            # Post WRITE and return; join in speculate_wait so DMA overlaps
+            # verify-side work after fire.
             t_xfer0 = time.perf_counter()
             handle = self._agent.initialize_xfer(
                 "WRITE",
@@ -543,21 +560,7 @@ class NixlClientTransport(DisaggDFlashClientTransport):
             if st == "ERR":
                 self._agent.release_xfer_handle(handle)
                 raise RuntimeError("Disagg-DFlash NIXL WRITE transfer failed")
-            if st != "DONE":
-                _wait_xfer_done(self._agent, handle, timeout_s=self._timeout_s)
-            e2e_us = (time.perf_counter() - t_xfer0) * 1e6
-            # Must read telemetry before release (P/D NixlConnector pattern).
-            telemetry = _read_xfer_telemetry(self._agent, handle)
-            self._agent.release_xfer_handle(handle)
-            xfer_timings = self._record_and_maybe_log_xfer(
-                nbytes=nbytes,
-                e2e_us=e2e_us,
-                telemetry=telemetry,
-                n_ctx=n_ctx,
-                num_reqs=num_reqs,
-            )
-
-        t2 = time.perf_counter()
+            # st may be DONE immediately for tiny payloads; still finish in wait.
 
         nixl_req = DisaggDFlashSpeculateRequest(
             req_ids=request.req_ids,
@@ -573,24 +576,25 @@ class NixlClientTransport(DisaggDFlashClientTransport):
             num_speculative_tokens=request.num_speculative_tokens,
             payload_mode=PAYLOAD_NIXL,
         )
-        frames = nixl_req.encode()
-        self._zmq.send(frames)
-        t_send = time.perf_counter()
+        t_kick = time.perf_counter()
 
         k = int(request.num_speculative_tokens)
         self._inflight = {
             "num_reqs": num_reqs,
             "k": k,
+            "n_ctx": n_ctx,
+            "nbytes": nbytes,
             "profile": profile,
             "t0": t0,
             "t1": t1,
-            "t2": t2,
-            "t_send": t_send,
-            "xfer_timings": xfer_timings,
+            "t_kick": t_kick,
+            "t_xfer0": t_xfer0,
+            "handle": handle,
+            "nixl_req": nixl_req,
         }
 
     def speculate_wait(self) -> DisaggDFlashSpeculateResponse:
-        """Recv draft token ids on ZMQ (always — payload is tiny)."""
+        """Join NIXL WRITE, send ZMQ meta, then recv draft token ids."""
         inflight = getattr(self, "_inflight", None)
         if inflight is None:
             raise RuntimeError(
@@ -600,14 +604,51 @@ class NixlClientTransport(DisaggDFlashClientTransport):
 
         num_reqs = int(inflight["num_reqs"])
         k = int(inflight["k"])
+        n_ctx = int(inflight["n_ctx"])
+        nbytes = int(inflight["nbytes"])
         profile = bool(inflight["profile"])
+        handle = inflight.get("handle")
+        nixl_req: DisaggDFlashSpeculateRequest = inflight["nixl_req"]
+        assert self._agent is not None
+
+        xfer_timings: dict[str, float] = {}
+        t2 = time.perf_counter()
+        if handle is not None:
+            try:
+                st = self._agent.check_xfer_state(handle)
+                if st == "ERR":
+                    raise RuntimeError("Disagg-DFlash NIXL WRITE entered ERR state")
+                if st != "DONE":
+                    _wait_xfer_done(self._agent, handle, timeout_s=self._timeout_s)
+                t2 = time.perf_counter()
+                e2e_us = (t2 - float(inflight["t_xfer0"])) * 1e6
+                # Must read telemetry before release (P/D NixlConnector pattern).
+                telemetry = _read_xfer_telemetry(self._agent, handle)
+                xfer_timings = self._record_and_maybe_log_xfer(
+                    nbytes=nbytes,
+                    e2e_us=e2e_us,
+                    telemetry=telemetry,
+                    n_ctx=n_ctx,
+                    num_reqs=num_reqs,
+                )
+            finally:
+                try:
+                    self._agent.release_xfer_handle(handle)
+                except Exception as e:
+                    logger.warning(
+                        "Disagg-DFlash NIXL release_xfer_handle failed: %s", e
+                    )
+
+        # Only notify draft after remote staging is visible (NIXL DONE).
+        frames = nixl_req.encode()
+        self._zmq.send(frames)
+        t_send = time.perf_counter()
 
         t_recv0 = time.perf_counter()
         resp_frames = self._zmq.recv()
         t3 = time.perf_counter()
         recv_us = (t3 - t_recv0) * 1e6
-        t_send = float(inflight.get("t_send") or 0.0)
-        rtt_us = (t3 - t_send) * 1e6 if t_send > 0.0 else None
+        rtt_us = (t3 - t_send) * 1e6
 
         resp = DisaggDFlashSpeculateResponse.decode(resp_frames)
         out = resp.draft_tokens
@@ -632,20 +673,22 @@ class NixlClientTransport(DisaggDFlashClientTransport):
         )
 
         # Always surface transfer / ZMQ pieces for Tad (cheap wall clocks).
-        xfer_timings = inflight.get("xfer_timings") or {}
         self.last_timings_ms = dict(xfer_timings) if isinstance(xfer_timings, dict) else {}
-        self.last_timings_ms["zmq_recv_ms"] = (t3 - t_send) * 1000.0 if t_send > 0 else 0.0
-        self.last_timings_ms["zmq_rtt_ms"] = (
-            (t3 - float(inflight["t2"])) * 1000.0 if inflight.get("t2") else 0.0
-        )
+        self.last_timings_ms["zmq_recv_ms"] = (t3 - t_send) * 1000.0
+        self.last_timings_ms["zmq_rtt_ms"] = (t3 - t2) * 1000.0
         if profile:
             t0 = float(inflight["t0"])
             t1 = float(inflight["t1"])
-            t2 = float(inflight["t2"])
+            t_kick = float(inflight["t_kick"])
             self.last_timings_ms.update(
                 {
                     "nixl_prep_ms": (t1 - t0) * 1000.0,
-                    "nixl_write_ms": (t2 - t1) * 1000.0,
+                    "nixl_kick_ms": (t_kick - t1) * 1000.0,
+                    "nixl_write_ms": (t2 - float(inflight["t_xfer0"] or t_kick))
+                    * 1000.0
+                    if nbytes > 0
+                    else 0.0,
+                    "nixl_await_ms": (t2 - t_kick) * 1000.0,
                     "zmq_send_ms": (t_send - t2) * 1000.0,
                     "token_h2d_ms": (t4 - t3) * 1000.0,
                     "nixl_total_ms": (t4 - t0) * 1000.0,
